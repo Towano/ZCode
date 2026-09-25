@@ -80,9 +80,15 @@ async function resolvePackageJsonPath(requireFrom, packageName) {
     if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") {
       throw error;
     }
-    let current = dirname(requireFrom.resolve(packageName));
+    let current;
+    try {
+      current = dirname(requireFrom.resolve("./package.json"));
+    } catch {
+      current = dirname(requireFrom.resolve("."));
+    }
+    const packageParts = packageName.split("/");
     for (;;) {
-      const candidate = resolve(current, "package.json");
+      const candidate = resolve(current, "node_modules", ...packageParts, "package.json");
       if (await pathExists(candidate)) {
         try {
           const packageJson = await readJson(candidate);
@@ -164,12 +170,21 @@ export async function copyRuntimeNodeModules(packageRoot) {
       seen,
     });
   }
-  // CLI 的浏览器运行时同样是外部依赖，不能依赖开发仓库的 hoisted node_modules。
+  // CLI 的 TUI 与浏览器运行时同样是外部依赖，不能依赖开发仓库的 hoisted node_modules。
+  const requireFromCli = createRequire(resolve(root, "apps/zcode-cli/packages/cli/package.json"));
+  const agentRoot = resolve(packageRoot, "agent");
+  const agentSeen = new Set();
+  await copyRuntimePackageTree({
+    packageName: "@zcode/tui",
+    packageRoot: agentRoot,
+    requireFrom: requireFromCli,
+    seen: agentSeen,
+  });
   await copyRuntimePackageTree({
     packageName: "playwright-core",
-    packageRoot: resolve(packageRoot, "agent"),
-    requireFrom: createRequire(resolve(root, "apps/zcode-cli/packages/cli/package.json")),
-    seen: new Set(),
+    packageRoot: agentRoot,
+    requireFrom: requireFromCli,
+    seen: agentSeen,
   });
 }
 
