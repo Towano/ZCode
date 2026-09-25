@@ -31,7 +31,9 @@ coverage/
 z-work/
 openclaw/
 .run-logs/
-.worktrees/
+.superpowers/
+/build/zcode-linux/
+/release/
 packages/stream-animate/dist-server/
 packages/stream-animate/.stream-animate-data/
 .codegraph
