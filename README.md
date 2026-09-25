@@ -121,6 +121,59 @@ node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
 
 这个入口直接运行 Agent CLI，不经过发行包的 `--web` 分流。开发 Web 用 `pnpm dev:web`；验证统一的 `zcode` 命令，用下方解压后的 `bin/zcode.mjs`。
 
+### Linux 本地构建与用户级安装
+
+Linux 本地流程只面向当前执行机器的平台和架构，不做跨架构编译。用户只需要操作仓库根目录的 `zcode-linux`：
+
+```bash
+# 启动终端菜单
+./zcode-linux
+
+# 或直接执行命令
+./zcode-linux build
+./zcode-linux install
+./zcode-linux verify
+./zcode-linux package
+```
+
+无参数运行 `./zcode-linux` 会显示终端菜单。`--h`、`-h` 和 `--help` 会显示所有命令和参数。构建临时目录位于 `build/zcode-linux/`，发行归档位于仓库根目录 `release/`：
+
+```text
+build/zcode-linux/<version>/     # 本地可运行构建
+release/zcode-<version>-linux-<arch>.tar.gz
+release/zcode-<version>-linux-<arch>.tar.gz.md5
+```
+
+本地安装默认直接使用 `build/` 中的可运行目录，不强制经过 tar.gz。安装到当前用户：
+
+```text
+~/.zcode/runtime
+~/.local/bin/zcode
+~/.zcode/uninstall.sh
+```
+
+安装会验证版本、TUI、Web、HTTP、WebSocket 和退出链路，并默认将通用的 `~/.local/bin` 加入用户 Shell 配置。若当前终端尚未刷新，执行：
+
+```bash
+source ~/.bashrc
+```
+
+安装完成后运行：
+
+```bash
+zcode
+zcode --web
+```
+
+默认卸载只移除程序并保留用户数据；完全卸载使用：
+
+```bash
+~/.zcode/uninstall.sh
+~/.zcode/uninstall.sh --purge
+```
+
+本地安装后的运行需要 Node.js，但不需要 pnpm。
+
 ## 配置
 
 根目录 [.env.example](.env.example) 提供服务地址与构建配置示例，可按需复制到 `.env`，本地覆盖放入 `.env.local`。Desktop 的开发环境通过 `dev:desktop:test` / `dev:desktop:prod` 选择。

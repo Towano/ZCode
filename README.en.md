@@ -115,6 +115,59 @@ node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
 
 This entry runs the Agent CLI directly and does not handle the distribution's `--web` switch. Use `pnpm dev:web` for Web development, or the extracted `bin/zcode.mjs` shown below to test the unified command.
 
+### Linux Local Build and User Install
+
+The Linux local flow targets the platform and architecture of the machine running the build; it does not cross-compile. Use the root-level `zcode-linux` controller:
+
+```bash
+# Open the terminal menu
+./zcode-linux
+
+# Or run commands directly
+./zcode-linux build
+./zcode-linux install
+./zcode-linux verify
+./zcode-linux package
+```
+
+Running `./zcode-linux` without arguments opens the terminal menu. `--h`, `-h`, and `--help` show all commands and options. Build staging stays under `build/zcode-linux/`; release archives go directly under the repository-root `release/` directory:
+
+```text
+build/zcode-linux/<version>/     # runnable local build
+release/zcode-<version>-linux-<arch>.tar.gz
+release/zcode-<version>-linux-<arch>.tar.gz.md5
+```
+
+Local installation uses the runnable build directory by default and does not require a tarball round trip. It installs for the current user at:
+
+```text
+~/.zcode/runtime
+~/.local/bin/zcode
+~/.zcode/uninstall.sh
+```
+
+Installation verifies the version, TUI, Web, HTTP, WebSocket, and shutdown paths. PATH setup is enabled by default and adds the generic `~/.local/bin` directory to the user's shell configuration. If the current shell has not reloaded it yet, run:
+
+```bash
+source ~/.bashrc
+```
+
+After installation:
+
+```bash
+zcode
+zcode --web
+```
+
+Default uninstall removes only the program and keeps user data. Complete removal uses:
+
+```bash
+~/.zcode/uninstall.sh
+~/.zcode/uninstall.sh --purge
+```
+
+Running the installed distribution requires Node.js, but not pnpm.
+
 ## Configuration
 
 The root [.env.example](.env.example) provides sample service URLs and build configuration. Copy it to `.env` as needed and place local overrides in `.env.local`. Select the Desktop development environment with `dev:desktop:test` or `dev:desktop:prod`.
