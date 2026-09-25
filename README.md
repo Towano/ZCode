@@ -123,20 +123,30 @@ node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
 
 ### Linux 本地构建与用户级安装
 
-Linux 本地流程只面向当前执行机器的平台和架构，不做跨架构编译。用户只需要操作仓库根目录的 `zcode-linux`：
+Linux 本地流程只面向当前执行机器的平台和架构，不做跨架构编译。普通用户只需要从仓库根目录运行：
 
 ```bash
-# 启动终端菜单
 ./zcode-linux
-
-# 或直接执行命令
-./zcode-linux build
-./zcode-linux install
-./zcode-linux verify
-./zcode-linux package
 ```
 
-无参数运行 `./zcode-linux` 会显示终端菜单。`--h`、`-h` 和 `--help` 会显示所有命令和参数。构建临时目录位于 `build/zcode-linux/`，发行归档位于仓库根目录 `release/`：
+菜单只有三项：
+
+```text
+[1] 编译
+[2] 安装
+[3] 卸载
+[0] 退出
+```
+
+编译和安装会自动检查环境，不需要先运行隐藏的诊断命令。缺失依赖会一次性列出；按 `Enter` 安装或确认，按 `Esc` / `Ctrl-C` 取消。安装不会自动编译，也不会默认选择最新构建：先从 `build/zcode-linux/` 选择具体构建，再按 `Enter` 确认。
+
+支持的 Linux 包管理器只有：
+
+- Debian / Ubuntu：`apt`
+- Arch / Manjaro / CachyOS：`pacman`
+- Alpine：`apk`
+
+构建要求 Node.js `24.14.0` 和 pnpm `10.33.2`；已安装的运行包只要求 Node.js。流程只生成当前机器的 Linux x64 或 arm64 构建。构建临时目录位于 `build/zcode-linux/`，发行归档位于仓库根目录 `release/`：
 
 ```text
 build/zcode-linux/<version>/     # 本地可运行构建
@@ -144,7 +154,7 @@ release/zcode-<version>-linux-<arch>.tar.gz
 release/zcode-<version>-linux-<arch>.tar.gz.md5
 ```
 
-本地安装默认直接使用 `build/` 中的可运行目录，不强制经过 tar.gz。安装到当前用户：
+安装到当前用户：
 
 ```text
 ~/.zcode/runtime
@@ -152,27 +162,15 @@ release/zcode-<version>-linux-<arch>.tar.gz.md5
 ~/.zcode/uninstall.sh
 ```
 
-安装会验证版本、TUI、Web、HTTP、WebSocket 和退出链路，并默认将通用的 `~/.local/bin` 加入用户 Shell 配置。若当前终端尚未刷新，执行：
+卸载首屏可选择保留数据或删除全部数据；没有选择时按 `Enter`、`Esc` 或 `Ctrl-C` 都不会删除任何内容。安装完成后运行：
 
 ```bash
-source ~/.bashrc
-```
-
-安装完成后运行：
-
-```bash
+source ~/.bashrc  # 当前 Shell 尚未刷新时
 zcode
 zcode --web
 ```
 
-默认卸载只移除程序并保留用户数据；完全卸载使用：
-
-```bash
-~/.zcode/uninstall.sh
-~/.zcode/uninstall.sh --purge
-```
-
-本地安装后的运行需要 Node.js，但不需要 pnpm。
+高级维护命令仍可通过 `./zcode-linux --help` 查看，但日常使用不需要它们。
 
 ## 配置
 

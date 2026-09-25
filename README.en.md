@@ -117,20 +117,30 @@ This entry runs the Agent CLI directly and does not handle the distribution's `-
 
 ### Linux Local Build and User Install
 
-The Linux local flow targets the platform and architecture of the machine running the build; it does not cross-compile. Use the root-level `zcode-linux` controller:
+The Linux local flow targets only the platform and architecture of the current machine; it does not cross-compile. From the repository root, normal users only need:
 
 ```bash
-# Open the terminal menu
 ./zcode-linux
-
-# Or run commands directly
-./zcode-linux build
-./zcode-linux install
-./zcode-linux verify
-./zcode-linux package
 ```
 
-Running `./zcode-linux` without arguments opens the terminal menu. `--h`, `-h`, and `--help` show all commands and options. Build staging stays under `build/zcode-linux/`; release archives go directly under the repository-root `release/` directory:
+The menu contains three operations:
+
+```text
+[1] Build
+[2] Install
+[3] Uninstall
+[0] Exit
+```
+
+Build and Install perform their environment checks automatically; no separate diagnostic command is required. Missing dependencies are shown together. Press `Enter` to install or confirm, and `Esc` / `Ctrl-C` to cancel. Install never builds automatically or silently chooses the newest artifact: select a concrete build from `build/zcode-linux/`, then press `Enter` to confirm.
+
+Supported Linux package managers are intentionally limited to:
+
+- Debian / Ubuntu: `apt`
+- Arch / Manjaro / CachyOS: `pacman`
+- Alpine: `apk`
+
+Builds require Node.js `24.14.0` and pnpm `10.33.2`; running an installed package requires Node.js only. The controller produces only a Linux x64 or arm64 build for the current machine. Build staging stays under `build/zcode-linux/`; release archives go under `release/`:
 
 ```text
 build/zcode-linux/<version>/     # runnable local build
@@ -138,7 +148,7 @@ release/zcode-<version>-linux-<arch>.tar.gz
 release/zcode-<version>-linux-<arch>.tar.gz.md5
 ```
 
-Local installation uses the runnable build directory by default and does not require a tarball round trip. It installs for the current user at:
+The per-user installation is:
 
 ```text
 ~/.zcode/runtime
@@ -146,27 +156,15 @@ Local installation uses the runnable build directory by default and does not req
 ~/.zcode/uninstall.sh
 ```
 
-Installation verifies the version, TUI, Web, HTTP, WebSocket, and shutdown paths. PATH setup is enabled by default and adds the generic `~/.local/bin` directory to the user's shell configuration. If the current shell has not reloaded it yet, run:
+Uninstall first offers a choice between keeping data and removing all data. With no choice selected, `Enter`, `Esc`, and `Ctrl-C` all leave everything untouched. After installation:
 
 ```bash
-source ~/.bashrc
-```
-
-After installation:
-
-```bash
+source ~/.bashrc  # if the current shell has not reloaded it
 zcode
 zcode --web
 ```
 
-Default uninstall removes only the program and keeps user data. Complete removal uses:
-
-```bash
-~/.zcode/uninstall.sh
-~/.zcode/uninstall.sh --purge
-```
-
-Running the installed distribution requires Node.js, but not pnpm.
+Advanced maintenance commands remain available through `./zcode-linux --help`, but are not part of the normal daily workflow.
 
 ## Configuration
 
@@ -247,7 +245,7 @@ Open `http://127.0.0.1:3030` to validate the complete flow, with one backend ser
 ## Repository Structure
 
 | Directory                                            | Responsibility                                                                          |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `packages/desktop`                                   | Electron Main, Host, Renderer, and desktop packaging                                    |
 | `packages/web`                                       | Web client                                                                              |
 | `packages/server`                                    | HTTP / WebSocket services and remote connections                                        |

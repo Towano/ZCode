@@ -30,6 +30,10 @@ assert_not_contains() {
   ! grep -Fq -- "$2" "$1" || fail "did not expect '$2' in $1"
 }
 
+assert_equals() {
+  [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
+}
+
 assert_command_success() {
   local output_file="$1"
   shift
@@ -75,15 +79,135 @@ JSON
   printf '%s\n' "$fixture"
 }
 
+test_dependency_resolver() {
+  local fixture="$TEST_ROOT/os-release-fixtures"
+  rm -rf "$fixture"
+  mkdir -p "$fixture"
+
+  cat >"$fixture/ubuntu" <<'EOF'
+ID=ubuntu
+ID_LIKE=debian
+EOF
+  cat >"$fixture/debian" <<'EOF'
+ID=debian
+EOF
+  cat >"$fixture/arch" <<'EOF'
+ID=arch
+EOF
+  cat >"$fixture/manjaro" <<'EOF'
+ID=manjaro
+ID_LIKE=arch
+EOF
+  cat >"$fixture/cachyos" <<'EOF'
+ID=cachyos
+ID_LIKE=arch
+EOF
+  cat >"$fixture/alpine" <<'EOF'
+ID=alpine
+EOF
+  cat >"$fixture/unknown" <<'EOF'
+ID=some-linux
+ID_LIKE=some-family
+EOF
+
+  # This is intentionally red before scripts/zcode-linux-deps.sh exists.
+  # shellcheck disable=SC1090
+  source "$ROOT_DIR/scripts/zcode-linux-deps.sh"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/ubuntu")" "apt"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/debian")" "apt"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/arch")" "pacman"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/manjaro")" "pacman"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/cachyos")" "pacman"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/alpine")" "apk"
+  assert_equals "$(zcode_linux_detect_package_manager "$fixture/unknown")" "unknown"
+  assert_equals "$(zcode_linux_required_packages build apt | paste -sd ' ' -)" "python3 make g++ pkg-config"
+  assert_equals "$(zcode_linux_required_packages build pacman | paste -sd ' ' -)" "python make gcc pkgconf"
+  assert_equals "$(zcode_linux_required_packages build apk | paste -sd ' ' -)" "python3 make g++ pkgconf"
+  assert_equals "$(zcode_linux_required_packages runtime apt | paste -sd ' ' -)" "bash tar coreutils"
+  assert_equals "$(zcode_linux_required_packages archive pacman | paste -sd ' ' -)" "tar gzip coreutils"
+  pass "Linux dependency distribution mapping"
+}
+
+test_uninstall_menu_is_safe_by_default() {
+  local home="$TEST_ROOT/home-uninstall-menu"
+  rm -rf "$home"
+  mkdir -p "$home/.zcode/v2"
+  printf 'keep\n' >"$home/.zcode/v2/sentinel"
+  assert_command_success "$TEST_ROOT/uninstall-menu.txt" bash -c \
+    "printf '3\n\n' | env HOME='$home' bash '$ROOT_DIR/zcode-linux'"
+  assert_file "$home/.zcode/v2/sentinel"
+  pass "uninstall menu does nothing when no option is selected"
+}
+
+test_explicit_artifact_selection() {
+  local home="$TEST_ROOT/home-selection"
+  local build_root="$ROOT_DIR/build/zcode-linux"
+  local first="$build_root/selection-a"
+  local second="$build_root/selection-b"
+  local wrong="$build_root/selection-wrong"
+  local fixture
+  rm -rf "$home" "$build_root"
+  mkdir -p "$home"
+  fixture=$(prepare_fixture)
+  cp -a "$fixture" "$first"
+  cp -a "$fixture" "$second"
+  cp -a "$fixture" "$wrong"
+  sed -i 's/fixture-1.0.0/selection-a/g' "$first/manifest.json"
+  sed -i 's/fixture-1.0.0/selection-b/g' "$second/manifest.json"
+  sed -i 's/"arm64"/"x64"/' "$wrong/manifest.json"
+
+  assert_command_success "$TEST_ROOT/selection-empty.txt" bash -c \
+    "printf '\n' | env HOME='$home' bash '$ROOT_DIR/zcode-linux' install --no-path --no-verify"
+  [ ! -e "$home/.zcode/runtime/current" ] || fail "Enter without an artifact selection installed a runtime"
+
+  assert_command_success "$TEST_ROOT/selection-install.txt" bash -c \
+    "printf '2\n\n' | env HOME='$home' bash '$ROOT_DIR/zcode-linux' install --no-path --no-verify"
+  [ "$(basename "$(readlink -f "$home/.zcode/runtime/current")")" = "selection-b" ] || fail "selected artifact was not installed"
+  assert_contains "$TEST_ROOT/selection-install.txt" "selection-a"
+  assert_contains "$TEST_ROOT/selection-install.txt" "selection-b"
+  assert_not_contains "$TEST_ROOT/selection-install.txt" "selection-wrong"
+  pass "install requires explicit matching artifact selection"
+}
+
+test_automatic_preflight() {
+  local home="$TEST_ROOT/home-preflight"
+  local fixture
+  rm -rf "$home"
+  mkdir -p "$home"
+  fixture=$(prepare_fixture)
+  # Hide Node.js while retaining the host's shell utilities. Esc must cancel
+  # the one-shot preflight before any install path is changed.
+  assert_command_failure "$TEST_ROOT/preflight.txt" bash -c \
+    "printf '\033' | env HOME='$home' PATH='/usr/bin:/bin' bash '$ROOT_DIR/zcode-linux' install --source '$fixture' --no-verify"
+  assert_contains "$TEST_ROOT/preflight.txt" "ENVIRONMENT CHECK"
+  assert_contains "$TEST_ROOT/preflight.txt" "Missing dependencies"
+  [ ! -e "$home/.zcode/runtime/current" ] || fail "cancelled preflight changed current runtime"
+  pass "install performs automatic preflight before changing runtime"
+}
+
+test_interactive_menu() {
+  local output="$TEST_ROOT/menu.txt"
+  assert_command_success "$output" bash -c "printf '0\n' | bash '$ROOT_DIR/zcode-linux'"
+  assert_contains "$output" "[1] Build"
+  assert_contains "$output" "[2] Install"
+  assert_contains "$output" "[3] Uninstall"
+  assert_not_contains "$output" "[3] Verify"
+  assert_not_contains "$output" "[4] Package"
+  assert_not_contains "$output" "[5] PATH"
+  assert_not_contains "$output" "[7] Purge"
+  pass "interactive menu exposes only build, install, and uninstall"
+}
+
 test_help() {
   local output="$TEST_ROOT/help.txt"
   assert_command_success "$output" bash "$ROOT_DIR/zcode-linux" --help
   assert_contains "$output" "build"
   assert_contains "$output" "install"
+  assert_contains "$output" "uninstall"
+  assert_contains "$output" "Advanced maintenance commands"
   assert_contains "$output" "verify"
   assert_contains "$output" "package"
   assert_contains "$output" "path"
-  assert_contains "$output" "uninstall"
   assert_contains "$output" "purge"
   assert_contains "$output" "--no-path"
   pass "help exposes the public Linux workflow"
@@ -230,6 +354,21 @@ rm -rf "$TEST_ROOT"
 mkdir -p "$TEST_ROOT"
 
 case "$MODE" in
+  --interaction)
+    test_interactive_menu
+    ;;
+  --preflight)
+    test_automatic_preflight
+    ;;
+  --selection)
+    test_explicit_artifact_selection
+    ;;
+  --uninstall-menu)
+    test_uninstall_menu_is_safe_by_default
+    ;;
+  --deps)
+    test_dependency_resolver
+    ;;
   --path-and-uninstall)
     test_help
     test_path_and_uninstall
@@ -244,11 +383,16 @@ case "$MODE" in
     fi
     ;;
   all)
+    test_dependency_resolver
+    test_interactive_menu
     test_help
     test_path_and_uninstall
     test_install_and_rollback
     test_runtime_dependencies
     test_package
+    test_automatic_preflight
+    test_uninstall_menu_is_safe_by_default
+    test_explicit_artifact_selection
     ;;
   *)
     fail "unknown test mode: $MODE"

@@ -1,145 +1,213 @@
-# ZCode Linux 本地构建与用户级安装设计
+# ZCode Linux 本地构建、安装与卸载交互设计
 
 ## 目标
 
-为 ZCode 的 CLI / TUI / Web 统一发行包提供 Linux 当前实机架构上的本地构建、用户级安装、运行验证、发行归档和独立卸载能力。
+为 Linux 当前执行机器提供 CLI / TUI / Web 统一发行包的本地构建、用户级安装、运行验证和卸载流程。普通用户只需要执行仓库根目录中的：
 
-本设计不包含 Electron Linux 安装包，也不把 SEA native binary 作为本次安装产物。
-
-## 用户入口
-
-仓库根目录提供两个用户可见脚本：
-
-```text
-zcode-linux
-uninstall-linux.sh
+```bash
+./zcode-linux
 ```
 
-`zcode-linux` 负责：
+本设计不包含 Electron Linux 安装包，也不包含 SEA native binary。
 
-- 无参数时显示终端交互菜单。
-- `build`：编译当前 Linux 平台和架构。
-- `install`：从本地可运行构建目录或显式 tar.gz 安装。
-- `verify`：验证已安装命令、Web、WebSocket 和退出链路。
-- `package`：生成根目录 `release/` 下的 tar.gz 和 MD5。
-- `path`：检查或配置用户 Shell 的命令路径。
-- `uninstall` / `purge`：调用当前源码中的卸载逻辑。
-- `-h`、`--h`、`--help`：输出命令和参数说明。
+## 普通用户界面
 
-`uninstall-linux.sh` 是安装时复制到 `~/.zcode/uninstall.sh` 的独立脚本。复制后的脚本不依赖源码、Node、pnpm、build 或 release 目录。
-
-## 本地目录
-
-所有新建的构建临时内容留在仓库内，不使用 `/tmp`、`/var/tmp` 或用户缓存目录。
+主菜单只显示三个操作：
 
 ```text
-build/zcode-linux/<version>/
-  zcode/          # 完整可运行目录
-  manifest.json
-  smoke/          # 验证过程临时内容
+ZCODE / LINUX CONTROL CONSOLE
 
-release/
-  zcode-<version>-linux-<arch>.tar.gz
-  zcode-<version>-linux-<arch>.tar.gz.md5
+[1] Build       编译
+[2] Install     安装
+[3] Uninstall   卸载
+[0] Exit        退出
 ```
 
-`build/` 是本地可运行构建目录；`release/` 只保存可选发行归档。默认本地安装直接使用 `build/`，不强制经过 tar.gz。
+普通用户不需要了解或选择 `check`、`verify`、`package`、`path`、`purge`。这些是内部步骤或维护能力，不出现在主菜单中。
 
-## 平台和架构
+`zcode-linux` 是无扩展名的 Bash 可执行脚本，依靠执行权限和 shebang 运行；`./` 表示执行当前目录中的脚本。用户从仓库根目录运行它，也可以使用绝对路径运行。
 
-构建必须在 Linux 上运行，并根据执行时的 `process.platform`、`process.arch` 选择当前平台和架构：
+## 统一键盘交互
 
-- `linux + x64` → `linux-x64`
-- `linux + arm64` → `linux-arm64`
+所有会产生副作用的操作统一使用：
 
-非 Linux、未知架构或不支持架构时立即失败。不允许用参数伪造目标架构或进行跨架构编译。
+- `Enter`：确认当前选择或执行。
+- `Esc`：取消、返回上一级或不执行。
+- `Ctrl-C`：等同 `Esc`，不得删除已有安装或数据。
 
-## 安装位置
+任何初始界面都不预选破坏性操作。没有选择时直接按 `Enter` 等同取消。
 
-固定使用当前用户目录，不提供安装目录参数：
+### 编译确认
+
+编译前显示当前 Linux 平台、架构、版本和输出目录；只有按 `Enter` 才开始。`Esc` / `Ctrl-C` 返回主菜单。
+
+### 安装确认
+
+安装绝不自动选择“最新”或任意构建产物。安装前枚举：
 
 ```text
-程序：$HOME/.zcode/runtime
-命令：$HOME/.local/bin/zcode
-卸载：$HOME/.zcode/uninstall.sh
+build/zcode-linux/<version>/manifest.json
 ```
 
-安装过程不使用 sudo，不写入 `/usr/bin`、`/usr/local/bin`、`/opt` 或 `/etc`。
+只显示平台为 Linux、架构与当前机器一致且运行目录完整的构建。用户先选择一个构建，再进入确认页；初始没有默认构建。直接 `Enter` 或 `Esc` 不安装。
 
-安装后的命令包装器使用安装时解析到的 Node 路径作为优先路径，并在路径失效时回退到 `command -v node`。运行发行包需要 Node，不依赖 pnpm。
+如果没有可用构建，只提示先执行“编译”，不自动编译。
 
-## 安装验证
+### 卸载确认
 
-安装不是单纯复制文件。安装脚本在更新 `current` 前后必须验证：
+卸载第一屏：
 
-1. `zcode --version` 返回构建版本。
-2. `zcode --web --help` 可执行。
-3. Web server 可以启动并输出本地 URL。
-4. `/api/server-info` 返回成功。
-5. WebSocket 可以连接。
-6. Web server 可以正常退出。
+```text
+[0] 返回 / 不操作
+[1] 卸载程序，保留用户数据
+[2] 卸载程序和全部用户数据
+```
 
-验证失败时返回非零状态，不报告安装成功，不更新 `current`，并保留既有可用版本。
+初始无选择，`Enter` / `Esc` / `Ctrl-C` 均不执行删除。选择后显示将删除的精确路径，再按 `Enter` 执行，`Esc` / `Ctrl-C` 取消。
 
-## PATH 配置
+## 自动环境前置检查
 
-安装默认配置用户 PATH；只有显式传入 `--no-path` 才跳过。
+`check` 可以作为主动诊断命令存在，但不是任何流程的前置要求。以下操作必须自动调用环境检查：
 
-Bash 的核心配置是通用语句，不加入 ZCode 专属注释：
+- Build：检查构建工具链。
+- Install：检查运行时工具链。
+- Verify：内部调用时检查运行时工具链。
+- Package：内部调用时检查归档工具。
+
+环境检查发生在实际编译、复制、切换安装版本之前；用户不可能因为忘记手动执行 `check` 而进入半失败流程。
+
+### 缺失依赖交互
+
+一次性列出全部缺失依赖，不逐个询问：
+
+```text
+ENVIRONMENT CHECK
+
+Distribution: Ubuntu 24.04
+Package manager: apt
+Architecture: x86_64
+
+Missing dependencies:
+  python3
+  make
+  g++
+  pkg-config
+
+Install all missing dependencies? [Y/n]
+```
+
+`Enter` 默认同意；`Esc` / `Ctrl-C` 取消并返回，不执行后续操作。确认后只执行一次包管理器安装流程，例如：
+
+```bash
+sudo apt update
+sudo apt install python3 make g++ pkg-config
+```
+
+安装结束后重新检查，仍然缺失则停止并给出明确错误。
+
+### 发行版支持
+
+根据 `/etc/os-release` 识别：
+
+| 发行版族 | 用户可见包管理器 | 构建包名 |
+| --- | --- | --- |
+| Debian / Ubuntu | `apt` | `python3 make g++ pkg-config` |
+| Arch / Manjaro / CachyOS | `pacman` | `python make gcc pkgconf` |
+| Alpine | `apk` | `python3 make g++ pkgconf` |
+
+用户界面显示 `apt`，不显示 `apt-get`。未知发行版只报告缺少的命令和建议手动安装方式，不猜测包管理器。
+
+### Node 和 pnpm
+
+构建工具链要求：
+
+```text
+Node.js 24.14.0
+pnpm 10.33.2
+```
+
+系统包管理器的 Node 版本不能直接视为满足要求。若检测到 `mise`，可以在统一确认流程中调用 `mise install`；没有 `mise` 时不覆盖用户 Node，只给出明确安装提示并停止。
+
+安装已构建运行包只需要 Node.js，不需要 pnpm、Python 或编译器。
+
+## 构建
+
+Build 内部执行：
+
+1. 自动环境前置检查。
+2. 构建 CLI/TUI/Agent workspace。
+3. 构建 Server。
+4. 构建 Web。
+5. 收集 TUI native、worker、Web、Server、Agent 和递归运行时依赖。
+6. 生成：
+
+```text
+build/zcode-linux/<version>/zcode/
+build/zcode-linux/<version>/manifest.json
+```
+
+7. 自动完成本地构建 smoke 验证。
+
+构建根据当前 `process.platform` / `process.arch` 工作，只支持 Linux x64 和 Linux arm64，不允许参数伪造架构或跨架构编译。
+
+## 安装
+
+Install 内部执行：
+
+1. 自动环境前置检查。
+2. 枚举并要求用户选择构建目录。
+3. 复制到：
+
+```text
+$HOME/.zcode/runtime/releases/<version>
+```
+
+4. 验证版本、TUI、Web、HTTP、WebSocket 和退出链路。
+5. 验证通过后才切换 `current`。
+6. 创建：
+
+```text
+$HOME/.local/bin/zcode
+$HOME/.zcode/uninstall.sh
+```
+
+7. 自动配置用户 PATH，不要求用户手动输入 `export PATH=...`。
+
+安装失败不得替换已有可用版本，也不得留下指向不存在 runtime 的 wrapper。
+
+## PATH
+
+PATH 配置是安装内部步骤，不是普通菜单选项。Bash 使用通用配置：
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-该语句放在 `~/.bashrc` 顶层，并尽量位于 Bash 的非交互提前 `return` 之前。已经存在相同配置时不重复写入。
-
-如果 Bash 登录入口不会加载 `~/.bashrc`，在实际生效的 `~/.bash_profile`、`~/.bash_login` 或 `~/.profile` 中确保存在：
-
-```bash
-[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-```
-
-安装程序不在 Shell 配置中写入 ZCode 专属注释；自身的修改记录写入 `~/.zcode/install-state.json`，权限为 `0600`。卸载时只撤销安装程序实际新增的行，不删除用户原有相同配置。
-
-当前已运行的父 Shell 无法被子进程直接修改；安装完成后提示 `source ~/.bashrc`，新终端自动生效。
-
-非 Bash 环境不写 Bash 语法：Zsh 使用 `~/.zshrc`，Fish 使用 `fish_add_path`，未知 Shell 不盲目修改。
-
-## 权限
+安装默认配置；用户选择跳过时使用内部 `--no-path` 维护参数。配置必须幂等、保留 owner 和权限，并记录安装器实际新增内容到：
 
 ```text
-~/.zcode                  0700
-~/.zcode/runtime          0755
-~/.zcode/runtime/releases 0755
-~/.local                  0755
-~/.local/bin              0755
-~/.local/bin/zcode        0755
-~/.zcode/uninstall.sh     0700
-~/.zcode/install-state.json 0600
-用户数据目录               0700
+$HOME/.zcode/install-state.json
 ```
-
-已有 Shell 配置文件保留原权限和 owner；新建 `~/.bashrc` / `~/.profile` 使用 `0644`。安装必须检查目标目录 owner、危险符号链接和写权限。
 
 ## 卸载
 
-默认：
+默认卸载删除程序并保留：
 
-```bash
-~/.zcode/uninstall.sh
+```text
+$HOME/.zcode/v2
+$HOME/.zcode/workspace
+$HOME/.zcode/cli
 ```
 
-删除程序 runtime、`current` 和 `~/.local/bin/zcode`，保留会话、工作区和配置数据。
+完全卸载由卸载界面的第二个选项触发，删除程序和用户数据。执行前必须显示精确路径并等待 `Enter`；`Esc` / `Ctrl-C` 取消。
 
-完全卸载：
+独立卸载脚本不依赖源码、Node、pnpm、build 或 release。
 
-```bash
-~/.zcode/uninstall.sh --purge
-~/.zcode/uninstall.sh --purge --yes
-```
+## 权限和安全
 
-`--purge` 删除 ZCode 用户数据，撤销安装程序自己新增的 PATH / Bash 登录配置，最后删除自身。
-
-## 交互菜单
-
-无参数执行 `./zcode-linux` 时显示 ANSI 终端菜单，展示平台、架构、构建状态、安装状态和 PATH 状态。菜单操作包含 build、install、verify、package、path、uninstall、purge 和 exit。无外部 TUI 依赖，颜色不可用时回退纯文本。
+- 用户级安装不调用 sudo。
+- 依赖安装可以在明确确认后使用系统包管理器的 sudo。
+- 检查外部符号链接、路径 owner 和空变量，拒绝危险删除。
+- 构建临时内容位于仓库 `build/zcode-linux/`，不使用系统 `/tmp`。
+- 发行归档位于仓库根目录 `release/`。
+- 本地运行包仍需要 Node.js，不需要 pnpm。

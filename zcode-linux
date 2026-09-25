@@ -31,6 +31,70 @@ ok() { printf '%s[ OK ]%s %s\n' "$GREEN" "$RESET" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf '%s[FAIL]%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
+DEPS_SOURCE="$ROOT_DIR/scripts/zcode-linux-deps.sh"
+[ -f "$DEPS_SOURCE" ] || die "missing dependency resolver: $DEPS_SOURCE"
+# shellcheck disable=SC1090
+source "$DEPS_SOURCE"
+
+ZCODE_INTERRUPT=0
+ZCODE_KEY=''
+ZCODE_SELECTION=''
+zcode_linux_handle_interrupt() {
+  ZCODE_INTERRUPT=1
+}
+trap zcode_linux_handle_interrupt INT
+
+read_single_key() {
+  local status
+  ZCODE_INTERRUPT=0
+  ZCODE_KEY=''
+  if IFS= read -r -n 1 -s ZCODE_KEY; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$ZCODE_INTERRUPT" -eq 1 ] || [ "$status" -ne 0 ]; then
+    ZCODE_INTERRUPT=0
+    return 1
+  fi
+  return 0
+}
+
+read_selection() {
+  local value='' key
+  ZCODE_SELECTION=''
+  while true; do
+    read_single_key || return 1
+    key="$ZCODE_KEY"
+    case "$key" in
+      $'\e') printf '\n'; return 1 ;;
+      '') printf '\n'; ZCODE_SELECTION="$value"; return 0 ;;
+      $'\177')
+        if [ -n "$value" ]; then
+          value="${value%?}"
+          printf '\b \b'
+        fi
+        ;;
+      [0-9]) value+="$key"; printf '%s' "$key" ;;
+    esac
+  done
+}
+
+confirm_enter() {
+  while true; do
+    read_single_key || return 1
+    case "$ZCODE_KEY" in
+      '') printf '\n'; return 0 ;;
+      $'\e') printf '\n'; return 1 ;;
+    esac
+  done
+}
+
+pause_screen() {
+  printf '\nPress Enter or Esc to return.\n'
+  read_single_key || true
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -38,13 +102,15 @@ Usage:
 
 Commands:
   build       Build the current Linux platform and architecture.
-  install     Install the latest local build; PATH setup is enabled by default.
+  install     Install a selected local build artifact.
+  uninstall   Remove the program or the program and all user data.
+  menu        Open the interactive terminal menu (default).
+
+Advanced maintenance commands:
   verify      Verify the installed runtime.
   package     Create release/*.tar.gz and its MD5 file.
   path        Check or configure the user command PATH.
-  uninstall   Remove the program but keep user data.
   purge       Remove the program and ZCode user data.
-  menu        Open the interactive terminal menu.
 
 Options:
   -h, --h, --help
@@ -124,6 +190,25 @@ arch_from_manifest() {
     if (typeof data.arch !== "string" || !data.arch) process.exit(1);
     process.stdout.write(data.arch);
   ' "$source_dir/manifest.json"
+}
+
+platform_from_manifest() {
+  local source_dir="$1"
+  require_command node
+  node -e '
+    const fs = require("node:fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (typeof data.platform !== "string" || !data.platform) process.exit(1);
+    process.stdout.write(data.platform);
+  ' "$source_dir/manifest.json"
+}
+
+require_build_toolchain() {
+  local node_version pnpm_version
+  node_version=$(node --version 2>/dev/null || true)
+  pnpm_version=$(pnpm --version 2>/dev/null || true)
+  [ "$node_version" = "v24.14.0" ] || die "Node.js 24.14.0 is required; found ${node_version:-missing}"
+  [ "$pnpm_version" = "10.33.2" ] || die "pnpm 10.33.2 is required; found ${pnpm_version:-missing}"
 }
 
 ensure_directory() {
@@ -453,8 +538,10 @@ normalize_runtime_permissions() {
 
 build_local() {
   require_linux
+  zcode_linux_preflight build
   require_command node
   require_command pnpm
+  require_build_toolchain
   [ "${CLEAN_BUILD:-false}" = true ] && rm -rf "$ROOT_DIR/build/zcode-linux"
   local args=("--local")
   [ "${SKIP_BUILD:-false}" = true ] && args+=("--skip-build")
@@ -463,6 +550,7 @@ build_local() {
 }
 
 package_local() {
+  zcode_linux_preflight archive
   local source_dir="${1:-$(latest_source_dir)}"
   local version arch archive release_dir
   assert_source_dir "$source_dir"
@@ -516,59 +604,162 @@ verify_local() {
   ok "runtime verified: $version"
 }
 
+build_action() {
+  cat <<EOF
+BUILD
+
+Platform: Linux
+Architecture: $(normalize_arch)
+Output: $ROOT_DIR/build/zcode-linux
+
+Press Enter to build.
+Press Esc or Ctrl-C to cancel.
+EOF
+  if confirm_enter; then
+    build_local
+  else
+    info "build cancelled"
+  fi
+}
+
+uninstall_menu() {
+  local choice
+  cat <<EOF
+UNINSTALL
+
+[0] Return / do nothing
+[1] Remove program, keep user data
+[2] Remove program and all user data
+
+No option is selected.
+Press Enter or Esc to do nothing and return.
+Select an option, then press Enter.
+EOF
+  read_selection || return 0
+  choice="$ZCODE_SELECTION"
+  case "$choice" in
+    1)
+      cat <<EOF
+
+CONFIRM UNINSTALL
+
+The program runtime and command wrapper will be removed.
+User data under $ZCODE_HOME will be kept.
+
+Press Enter to confirm.
+Press Esc or Ctrl-C to cancel.
+EOF
+      confirm_enter || return 0
+      bash "$UNINSTALL_SOURCE"
+      ;;
+    2)
+      cat <<EOF
+
+CONFIRM FULL UNINSTALL
+
+The program and all user data under $ZCODE_HOME will be removed.
+The command wrapper and PATH changes will also be removed.
+
+Press Enter to confirm deletion.
+Press Esc or Ctrl-C to cancel.
+EOF
+      confirm_enter || return 0
+      bash "$UNINSTALL_SOURCE" --purge --yes
+      ;;
+    *) return 0 ;;
+  esac
+}
+
 menu() {
   while true; do
     printf '\033[2J\033[H' 2>/dev/null || true
-    local version arch build_state install_state path_state choice
-    version=$(read_package_value version 2>/dev/null || printf 'unknown')
-    arch=$(normalize_arch 2>/dev/null || printf 'unsupported')
-    [ -d "$ROOT_DIR/build/zcode-linux/$version/zcode" ] && build_state="READY $version" || build_state="NOT BUILT"
-    [ -e "$RUNTIME_HOME/current" ] && install_state="READY" || install_state="NOT INSTALLED"
-    path_contains_local_bin && path_state="CONFIGURED" || path_state="NOT CONFIGURED"
-    cat <<EOF
+    cat <<'EOF'
 ZCODE / LINUX CONTROL CONSOLE
 
-SYSTEM
-  PLATFORM    Linux
-  ARCH        $arch
-  BUILD       $build_state
-  INSTALL     $install_state
-  COMMAND     $path_state
+[1] Build       Compile current Linux platform
+[2] Install     Install a selected build artifact
+[3] Uninstall   Remove program or program and data
+[0] Exit
 
-OPERATIONS
-  [1] Build       Compile current Linux platform
-  [2] Install     Install latest local build (PATH: enabled by default)
-  [3] Verify      Verify installed runtime
-  [4] Package     Create release archive and MD5
-  [5] PATH        Check or configure user command PATH
-  [6] Uninstall   Remove program, keep user data
-  [7] Purge       Remove program and user data
-  [0] Exit
-
+Select an operation, then press Enter.
+Press Esc or Ctrl-C to exit.
 EOF
-    read -r -p 'Select: ' choice || exit 0
+    local choice
+    read_selection || return 0
+    choice="$ZCODE_SELECTION"
     case "$choice" in
-      1) build_local ;;
-      2) install_command ;;
-      3) verify_local ;;
-      4) package_local ;;
-      5) configure_path ;;
-      6) bash "$UNINSTALL_SOURCE" ;;
-      7) bash "$UNINSTALL_SOURCE" --purge ;;
-      0|q|Q) exit 0 ;;
-      *) warn "unknown selection: $choice" ;;
+      1) build_action; pause_screen ;;
+      2) install_command; pause_screen ;;
+      3) uninstall_menu; pause_screen ;;
+      0|q|Q) return 0 ;;
+      *) warn "unknown selection: $choice"; pause_screen ;;
     esac
-    read -r -p 'Press Enter to return to menu...' _ || exit 0
   done
 }
 
+ZCODE_SELECTED_BUILD=''
+ZCODE_BUILD_PATHS=()
+
+list_installable_builds() {
+  local build_root="$ROOT_DIR/build/zcode-linux"
+  local manifest source_dir platform arch version size index=0
+  ZCODE_BUILD_PATHS=()
+  printf 'AVAILABLE BUILDS\n\n'
+  shopt -s nullglob
+  for manifest in "$build_root"/*/manifest.json; do
+    source_dir="$(dirname "$manifest")"
+    platform=$(platform_from_manifest "$source_dir" 2>/dev/null || true)
+    arch=$(arch_from_manifest "$source_dir" 2>/dev/null || true)
+    version=$(version_from_manifest "$source_dir" 2>/dev/null || true)
+    [ "$platform" = linux ] || continue
+    [ "$arch" = "$(normalize_arch)" ] || continue
+    [ -f "$source_dir/zcode/bin/zcode.mjs" ] || continue
+    [ -n "$version" ] || continue
+    index=$((index + 1))
+    ZCODE_BUILD_PATHS[$index]="$source_dir"
+    size=$(du -sh "$source_dir/zcode" 2>/dev/null | awk '{print $1}')
+    printf '[%s] %s  %s  %s\n' "$index" "$version" "$arch" "${size:-unknown}"
+  done
+  shopt -u nullglob
+  [ "$index" -gt 0 ] || {
+    printf '\nNo matching local build was found. Select Build first.\n'
+    return 1
+  }
+}
+
+select_build_artifact() {
+  local choice
+  list_installable_builds || return 1
+  printf '\nSelect a build, then press Enter. Press Esc to return.\n'
+  read_selection || return 1
+  choice="$ZCODE_SELECTION"
+  [ "$choice" != 0 ] || return 1
+  if [ -z "${ZCODE_BUILD_PATHS[$choice]:-}" ]; then
+    warn "unknown build selection: $choice"
+    return 1
+  fi
+  ZCODE_SELECTED_BUILD="${ZCODE_BUILD_PATHS[$choice]}"
+  cat <<EOF
+
+SELECTED BUILD
+
+Version: $(version_from_manifest "$ZCODE_SELECTED_BUILD")
+Architecture: $(arch_from_manifest "$ZCODE_SELECTED_BUILD")
+Path: $ZCODE_SELECTED_BUILD
+
+Press Enter to install.
+Press Esc or Ctrl-C to cancel.
+EOF
+  confirm_enter || return 1
+}
+
 install_command() {
-  local source_dir="$(latest_source_dir)"
-  local archive='' no_path=false no_verify=false
+  local source_dir='' archive='' no_path=false no_verify=false
+  local explicit_source=false explicit_archive=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --source) [ "$#" -ge 2 ] || die "--source requires a directory"; source_dir="$2"; shift 2 ;;
-      --archive) [ "$#" -ge 2 ] || die "--archive requires a file"; archive="$2"; shift 2 ;;
+      --source) [ "$#" -ge 2 ] || die "--source requires a directory"; source_dir="$2"; explicit_source=true; shift 2 ;;
+      --archive) [ "$#" -ge 2 ] || die "--archive requires a file"; archive="$2"; explicit_archive=true; shift 2 ;;
       --no-path) no_path=true; shift ;;
       --no-verify) no_verify=true; shift ;;
       --help|-h|--h) usage; return 0 ;;
@@ -576,13 +767,19 @@ install_command() {
     esac
   done
 
-  if [ -n "$archive" ]; then
+  require_linux
+  zcode_linux_preflight runtime
+
+  if [ "$explicit_archive" = true ]; then
     require_command tar
     local staging="$ROOT_DIR/build/zcode-linux/install-staging"
     rm -rf "$staging"
     mkdir -p "$staging"
     tar -xzf "$archive" -C "$staging"
     source_dir="$staging"
+  elif [ "$explicit_source" != true ]; then
+    select_build_artifact || return 0
+    source_dir="$ZCODE_SELECTED_BUILD"
   fi
   install_from_source "$source_dir" "$no_path" "$no_verify"
 }
@@ -603,7 +800,7 @@ main() {
           *) die "unknown build option: $1" ;;
         esac
       done
-      build_local
+      build_action
       ;;
     install) install_command "$@" ;;
     verify)
@@ -619,7 +816,7 @@ main() {
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --source) [ "$#" -ge 2 ] || die "--source requires a directory"; package_source="$2"; shift 2 ;;
-          --help|-h|--h) usage; return 0 ;;
+          --help|-h|--help) usage; return 0 ;;
           *) die "unknown package option: $1" ;;
         esac
       done
@@ -633,7 +830,7 @@ main() {
         *) die "unknown path option: $1" ;;
       esac
       ;;
-    uninstall) bash "$UNINSTALL_SOURCE" "$@" ;;
+    uninstall) uninstall_menu ;;
     purge) bash "$UNINSTALL_SOURCE" --purge "$@" ;;
     *) die "unknown command: $command (use --help)" ;;
   esac
