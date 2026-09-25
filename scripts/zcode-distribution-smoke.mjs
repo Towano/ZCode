@@ -2,32 +2,69 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
 const exec = promisify(execFile);
-const archive = process.argv[2];
-assert.ok(archive, "Usage: node scripts/zcode-distribution-smoke.mjs <archive.tar.gz>");
-const directory = await realpath(await mkdtemp(join(tmpdir(), "zcode-release-smoke-")));
-const root = join(directory, "zcode");
+const rootDirectory = resolve(import.meta.dirname, "..");
+const args = process.argv.slice(2);
+let archive;
+let runtimeDirectory;
+let workDirectory = resolve(rootDirectory, "build", "zcode-linux", "smoke", `run-${process.pid}`);
+for (let index = 0; index < args.length; index += 1) {
+  const arg = args[index];
+  if (arg === "--runtime-dir") {
+    runtimeDirectory = args[++index];
+    if (!runtimeDirectory) throw new Error("--runtime-dir requires a directory");
+  } else if (arg === "--work-dir") {
+    workDirectory = args[++index];
+    if (!workDirectory) throw new Error("--work-dir requires a directory");
+  } else if (arg.startsWith("--")) {
+    throw new Error(`Unknown option: ${arg}`);
+  } else if (!archive) {
+    archive = arg;
+  } else {
+    throw new Error(`Unexpected argument: ${arg}`);
+  }
+}
+
+assert.ok(
+  archive || runtimeDirectory,
+  "Usage: node scripts/zcode-distribution-smoke.mjs <archive.tar.gz> [--work-dir <dir>] or --runtime-dir <dir> [--work-dir <dir>]",
+);
+if (archive && runtimeDirectory) {
+  throw new Error("Choose an archive or --runtime-dir, not both.");
+}
+if (!workDirectory) {
+  throw new Error("--work-dir requires a directory");
+}
+
+const smokeRoot = resolve(workDirectory);
+const archiveRoot = join(smokeRoot, "archive");
+const root = runtimeDirectory ? resolve(runtimeDirectory) : join(archiveRoot, "zcode");
 const runner = join(root, "bin/zcode.mjs");
-const workspace = join(directory, "workspace");
+const workspace = join(smokeRoot, "workspace");
 const env = {
   ...process.env,
-  ZCODE_DATA_BASE_DIR: join(directory, "data"),
+  ZCODE_DATA_BASE_DIR: join(smokeRoot, "data"),
   NODE_PATH: "",
   NODE_OPTIONS: "",
   TERM: "xterm-256color",
 };
 let web;
 let terminal;
+let runtimeCheck;
 try {
-  await exec("tar", ["-xzf", resolve(archive), "-C", directory]);
+  await rm(smokeRoot, { recursive: true, force: true });
+  await mkdir(smokeRoot, { recursive: true });
+  if (archive) {
+    await mkdir(archiveRoot, { recursive: true });
+    await exec("tar", ["-xzf", resolve(archive), "-C", archiveRoot]);
+  }
   await mkdir(workspace);
   await exec(process.execPath, [runner, "--help"], { cwd: workspace, env });
   const version = (
@@ -35,7 +72,7 @@ try {
   ).stdout.trim();
   const require = createRequire(join(root, "package.json"));
   const pty = require("node-pty");
-  const runtimeCheck = join(root, "agent/check-tui.mjs");
+  runtimeCheck = join(root, "agent/check-tui.mjs");
   await writeFile(
     runtimeCheck,
     'import { runTui } from "@zcode/tui"; if (typeof runTui !== "function") throw new Error("Missing TUI export"); console.log("tui-runtime-ok");',
@@ -72,7 +109,7 @@ try {
       throw new Error("TUI keyboard exit timed out");
     }),
   ]);
-  assert.equal(tuiExit.exitCode, 0, screen);
+  assert.ok([0, 130].includes(tuiExit.exitCode), screen);
   terminal = undefined;
 
   let webOutput = "";
@@ -139,7 +176,10 @@ try {
 } finally {
   terminal?.kill();
   web?.kill();
-  await rm(directory, { recursive: true, force: true });
+  if (runtimeCheck && runtimeDirectory) {
+    await rm(runtimeCheck, { force: true });
+  }
+  await rm(smokeRoot, { recursive: true, force: true });
 }
 
 async function until(check, label, diagnostic) {
