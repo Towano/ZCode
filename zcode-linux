@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_PACKAGE_JSON="$ROOT_DIR/package.json"
+ZCODE_HOME="${HOME:?HOME is required}/.zcode"
+RUNTIME_HOME="$ZCODE_HOME/runtime"
+BIN_HOME="$HOME/.local/bin"
+COMMAND_PATH="$BIN_HOME/zcode"
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+LOGIN_BRIDGE='[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
+STATE_FILE="$ZCODE_HOME/install-state.json"
+UNINSTALL_SOURCE="$ROOT_DIR/uninstall-linux.sh"
+
+RED=''
+GREEN=''
+YELLOW=''
+BLUE=''
+RESET=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RED=$'\033[31m'
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  BLUE=$'\033[36m'
+  RESET=$'\033[0m'
+fi
+
+say() { printf '%s\n' "$*"; }
+info() { printf '%s[INFO]%s %s\n' "$BLUE" "$RESET" "$*"; }
+ok() { printf '%s[ OK ]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf '%s[FAIL]%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./zcode-linux [command] [options]
+
+Commands:
+  build       Build the current Linux platform and architecture.
+  install     Install the latest local build; PATH setup is enabled by default.
+  verify      Verify the installed runtime.
+  package     Create release/*.tar.gz and its MD5 file.
+  path        Check or configure the user command PATH.
+  uninstall   Remove the program but keep user data.
+  purge       Remove the program and ZCode user data.
+  menu        Open the interactive terminal menu.
+
+Options:
+  -h, --h, --help
+      Show this help.
+  --skip-build
+      Reuse existing package build outputs when supported.
+  --clean
+      Remove the previous local build before compiling.
+  --no-path
+      Skip automatic PATH configuration during install.
+  --source <directory>
+      Use a specific local build directory.
+  --archive <file>
+      Install from a release tar.gz instead of a local build directory.
+  --no-verify
+      Skip post-install verification. Not recommended.
+  --yes
+      Skip confirmation for purge operations.
+
+Examples:
+  ./zcode-linux
+  ./zcode-linux build
+  ./zcode-linux install
+  ./zcode-linux install --no-path
+  ./zcode-linux package
+  ./zcode-linux path --configure
+  ./zcode-linux uninstall
+  ./zcode-linux purge --yes
+EOF
+}
+
+require_linux() {
+  [ "$(uname -s)" = Linux ] || die "zcode-linux only supports Linux hosts"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+read_package_value() {
+  local key="$1"
+  require_command node
+  node -e '
+    const fs = require("node:fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const value = data[process.argv[2]];
+    if (typeof value !== "string" || value.length === 0) process.exit(1);
+    process.stdout.write(value);
+  ' "$REPO_PACKAGE_JSON" "$key"
+}
+
+normalize_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf '%s\n' x64 ;;
+    aarch64|arm64) printf '%s\n' arm64 ;;
+    *) die "unsupported Linux architecture: $(uname -m)" ;;
+  esac
+}
+
+version_from_manifest() {
+  local source_dir="$1"
+  require_command node
+  node -e '
+    const fs = require("node:fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (typeof data.version !== "string" || !data.version) process.exit(1);
+    process.stdout.write(data.version);
+  ' "$source_dir/manifest.json"
+}
+
+arch_from_manifest() {
+  local source_dir="$1"
+  require_command node
+  node -e '
+    const fs = require("node:fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (typeof data.arch !== "string" || !data.arch) process.exit(1);
+    process.stdout.write(data.arch);
+  ' "$source_dir/manifest.json"
+}
+
+ensure_directory() {
+  local directory="$1"
+  local mode="$2"
+  mkdir -p "$directory"
+  chmod "$mode" "$directory"
+}
+
+assert_safe_user_path() {
+  local path="$1"
+  case "$path" in
+    "$HOME"/*) ;;
+    *) die "refusing to operate outside the current user's home: $path" ;;
+  esac
+  if [ -L "$path" ]; then
+    local target
+    target=$(readlink -f "$path" 2>/dev/null || true)
+    case "$target" in
+      "$HOME"/*) ;;
+      *) die "refusing to follow a symlink outside the current user's home: $path" ;;
+    esac
+  fi
+  if [ -e "$path" ] && [ "$(stat -c '%u' "$path")" != "$(id -u)" ]; then
+    die "refusing to modify a path not owned by the current user: $path"
+  fi
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_state() {
+  local path_added="${1:-false}"
+  local path_file="${2:-}"
+  local bridge_added="${3:-false}"
+  local login_file="${4:-}"
+  ensure_directory "$ZCODE_HOME" 700
+  cat >"$STATE_FILE" <<EOF
+{
+  "pathLineAdded": $path_added,
+  "pathFile": "$(json_escape "$path_file")",
+  "loginBridgeAdded": $bridge_added,
+  "loginFile": "$(json_escape "$login_file")"
+}
+EOF
+  chmod 600 "$STATE_FILE"
+}
+
+path_contains_local_bin() {
+  case ":${PATH:-}:" in
+    *":$BIN_HOME:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+state_true() {
+  local key="$1"
+  [ -f "$STATE_FILE" ] && grep -Eq '"'"$key"'"[[:space:]]*:[[:space:]]*true' "$STATE_FILE"
+}
+
+state_value() {
+  local key="$1"
+  [ -f "$STATE_FILE" ] || return 0
+  sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE_FILE" | head -n 1
+}
+
+shell_name() {
+  basename "${SHELL:-bash}"
+}
+
+insert_top_level_line() {
+  local file="$1"
+  local line="$2"
+  local temp_file
+  local existing_line guard_line
+  existing_line=$(grep -nF "$line" "$file" | head -n 1 | cut -d: -f1 || true)
+  guard_line=$(grep -n '^case \$- in$' "$file" | head -n 1 | cut -d: -f1 || true)
+  if [ -n "$existing_line" ] && { [ -z "$guard_line" ] || [ "$existing_line" -lt "$guard_line" ]; }; then
+    return 1
+  fi
+
+  temp_file="$ROOT_DIR/build/zcode-linux/.path-edit.$$"
+  mkdir -p "$(dirname "$temp_file")"
+  awk -v path_line="$line" '
+    BEGIN { inserted = 0 }
+    !inserted && /^case \$- in$/ { print path_line; inserted = 1 }
+    { print }
+    END { if (!inserted) exit 42 }
+  ' "$file" >"$temp_file" || {
+    local status=$?
+    if [ "$status" -eq 42 ]; then
+      if head -n 1 "$file" | grep -q '^#!'; then
+        {
+          head -n 1 "$file"
+          printf '%s\n' "$line"
+          tail -n +2 "$file"
+        } >"$temp_file"
+      else
+        {
+          printf '%s\n' "$line"
+          cat "$file"
+        } >"$temp_file"
+      fi
+    else
+      rm -f "$temp_file"
+      return "$status"
+    fi
+  }
+  chmod --reference="$file" "$temp_file" 2>/dev/null || true
+  mv "$temp_file" "$file"
+  return 0
+}
+
+ensure_login_bridge() {
+  local file="$1"
+  [ -f "$file" ] || : >"$file"
+  if grep -Fqx "$LOGIN_BRIDGE" "$file"; then
+    return 1
+  fi
+  printf '%s\n' "$LOGIN_BRIDGE" >>"$file"
+  return 0
+}
+
+bash_login_file() {
+  local candidate
+  for candidate in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    if [ -e "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$HOME/.profile"
+}
+
+configure_path() {
+  local shell
+  local path_file=''
+  local login_file=''
+  local path_added=false
+  local bridge_added=false
+  shell=$(shell_name)
+
+  ensure_directory "$BIN_HOME" 755
+  info "PATH configuration"
+  printf '  shell: %s\n' "$shell"
+  printf '  command directory: %s\n' "$BIN_HOME"
+
+  case "$shell" in
+    bash)
+      path_file="$HOME/.bashrc"
+      if [ ! -e "$path_file" ]; then
+        : >"$path_file"
+        chmod 644 "$path_file"
+        info "created $path_file"
+      fi
+      if insert_top_level_line "$path_file" "$PATH_LINE"; then
+        path_added=true
+        info "added generic PATH line to $path_file"
+      else
+        info "generic PATH line already exists in $path_file"
+      fi
+      login_file=$(bash_login_file)
+      if [ "$login_file" != "$path_file" ]; then
+        if [ ! -e "$login_file" ]; then
+          : >"$login_file"
+          chmod 644 "$login_file"
+          info "created $login_file"
+        fi
+        if ensure_login_bridge "$login_file"; then
+          bridge_added=true
+          info "added Bash login bridge to $login_file"
+        else
+          info "Bash login bridge already exists in $login_file"
+        fi
+      fi
+      ;;
+    zsh)
+      path_file="$HOME/.zshrc"
+      if [ ! -e "$path_file" ]; then
+        : >"$path_file"
+        chmod 644 "$path_file"
+      fi
+      if insert_top_level_line "$path_file" "$PATH_LINE"; then
+        path_added=true
+        info "added generic PATH line to $path_file"
+      else
+        info "generic PATH line already exists in $path_file"
+      fi
+      ;;
+    fish)
+      path_file="$HOME/.config/fish/config.fish"
+      ensure_directory "$(dirname "$path_file")" 700
+      if [ ! -e "$path_file" ]; then
+        : >"$path_file"
+        chmod 644 "$path_file"
+      fi
+      if ! grep -Fqx 'fish_add_path -m "$HOME/.local/bin"' "$path_file"; then
+        printf '%s\n' 'fish_add_path -m "$HOME/.local/bin"' >>"$path_file"
+        path_added=true
+        info "added Fish user path to $path_file"
+      else
+        info "Fish user path already exists in $path_file"
+      fi
+      ;;
+    *)
+      warn "unsupported shell '$shell'; PATH was not written"
+      write_state false '' false ''
+      return 0
+      ;;
+  esac
+
+  if state_true pathLineAdded; then
+    path_added=true
+    [ -n "$path_file" ] || path_file=$(state_value pathFile)
+  fi
+  if state_true loginBridgeAdded; then
+    bridge_added=true
+    [ -n "$login_file" ] || login_file=$(state_value loginFile)
+  fi
+  write_state "$path_added" "$path_file" "$bridge_added" "$login_file"
+  if path_contains_local_bin; then
+    ok "current PATH already contains $BIN_HOME"
+  else
+    warn "current shell needs reload: source $path_file"
+  fi
+}
+
+path_status() {
+  printf 'shell: %s\n' "$(shell_name)"
+  printf 'command directory: %s\n' "$BIN_HOME"
+  if path_contains_local_bin; then
+    printf 'PATH: configured in current shell\n'
+  else
+    printf 'PATH: not present in current shell\n'
+  fi
+  case "$(shell_name)" in
+    bash) [ -f "$HOME/.bashrc" ] && printf 'bashrc: %s\n' "$HOME/.bashrc" || printf 'bashrc: missing\n' ;;
+    zsh) [ -f "$HOME/.zshrc" ] && printf 'zshrc: %s\n' "$HOME/.zshrc" || printf 'zshrc: missing\n' ;;
+    fish) [ -f "$HOME/.config/fish/config.fish" ] && printf 'fish config: %s\n' "$HOME/.config/fish/config.fish" || printf 'fish config: missing\n' ;;
+    *) printf 'shell configuration: unsupported\n' ;;
+  esac
+}
+
+copy_uninstaller() {
+  [ -f "$UNINSTALL_SOURCE" ] || die "missing uninstall-linux.sh"
+  ensure_directory "$ZCODE_HOME" 700
+  cp "$UNINSTALL_SOURCE" "$ZCODE_HOME/uninstall.sh"
+  chmod 700 "$ZCODE_HOME/uninstall.sh"
+}
+
+install_from_source() {
+  local source_dir="$1"
+  local no_path="$2"
+  local no_verify="$3"
+  local version arch target node_bin
+
+  assert_source_dir "$source_dir"
+  version=$(version_from_manifest "$source_dir") || die "invalid build manifest: $source_dir/manifest.json"
+  arch=$(arch_from_manifest "$source_dir") || die "invalid build architecture: $source_dir/manifest.json"
+  [ "$arch" = "$(normalize_arch)" ] || die "build architecture $arch does not match host $(normalize_arch)"
+  node_bin=$(command -v node || true)
+  [ -n "$node_bin" ] || die "Node.js is required to run the installed ZCode runtime"
+
+  assert_safe_user_path "$ZCODE_HOME"
+  assert_safe_user_path "$RUNTIME_HOME"
+  assert_safe_user_path "$BIN_HOME"
+  ensure_directory "$RUNTIME_HOME" 755
+  ensure_directory "$RUNTIME_HOME/releases" 755
+  target="$RUNTIME_HOME/releases/$version"
+  rm -rf "$target"
+  cp -a "$source_dir/zcode" "$target"
+  normalize_runtime_permissions "$target"
+
+  if [ "$no_verify" != true ]; then
+    verify_runtime "$target" "$version" || {
+      rm -rf "$target"
+      die "installed runtime verification failed; current version was not changed"
+    }
+  fi
+
+  ensure_directory "$BIN_HOME" 755
+  cat >"$COMMAND_PATH" <<EOF
+#!/usr/bin/env sh
+set -eu
+NODE_BIN="${node_bin}"
+if [ ! -x "\$NODE_BIN" ]; then
+  NODE_BIN="\$(command -v node || true)"
+fi
+if [ -z "\$NODE_BIN" ] || [ ! -x "\$NODE_BIN" ]; then
+  echo "ZCode requires Node.js; install Node.js 24.14.0 or set ZCODE_NODE_BIN." >&2
+  exit 1
+fi
+exec "\$NODE_BIN" "\$HOME/.zcode/runtime/current/bin/zcode.mjs" "\$@"
+EOF
+  chmod 755 "$COMMAND_PATH"
+  copy_uninstaller
+  if [ "$no_path" != true ]; then
+    configure_path
+  fi
+  ln -sfn "$target" "$RUNTIME_HOME/current"
+  if [ "$no_verify" != true ]; then
+    verify_installed_command "$version"
+  fi
+  ok "ZCode $version installed"
+}
+
+assert_source_dir() {
+  local source_dir="$1"
+  [ -d "$source_dir" ] || die "build directory does not exist: $source_dir"
+  [ -f "$source_dir/manifest.json" ] || die "missing build manifest: $source_dir/manifest.json"
+  [ -f "$source_dir/zcode/bin/zcode.mjs" ] || die "missing runtime runner: $source_dir/zcode/bin/zcode.mjs"
+}
+
+latest_source_dir() {
+  local version
+  version=$(read_package_value version)
+  printf '%s\n' "$ROOT_DIR/build/zcode-linux/$version"
+}
+
+normalize_runtime_permissions() {
+  local runtime_dir="$1"
+  find "$runtime_dir" -type d -exec chmod 755 {} +
+  find "$runtime_dir" -type f -perm /111 -exec chmod 755 {} +
+  find "$runtime_dir" -type f ! -perm /111 -exec chmod 644 {} +
+}
+
+build_local() {
+  require_linux
+  require_command node
+  require_command pnpm
+  [ "${CLEAN_BUILD:-false}" = true ] && rm -rf "$ROOT_DIR/build/zcode-linux"
+  local args=("--local")
+  [ "${SKIP_BUILD:-false}" = true ] && args+=("--skip-build")
+  node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}"
+  normalize_runtime_permissions "$ROOT_DIR/build/zcode-linux/$(read_package_value version)/zcode"
+}
+
+package_local() {
+  local source_dir="${1:-$(latest_source_dir)}"
+  local version arch archive release_dir
+  assert_source_dir "$source_dir"
+  version=$(version_from_manifest "$source_dir")
+  arch=$(arch_from_manifest "$source_dir")
+  release_dir="$ROOT_DIR/release"
+  archive="$release_dir/zcode-$version-linux-$arch.tar.gz"
+  ensure_directory "$release_dir" 755
+  rm -f "$archive" "$archive.md5"
+  tar -czf "$archive" -C "$source_dir" zcode manifest.json
+  chmod 644 "$archive"
+  (cd "$ROOT_DIR" && md5sum "${archive#"$ROOT_DIR/"}") >"$archive.md5"
+  chmod 644 "$archive.md5"
+  ok "release archive: $archive"
+  ok "MD5: $archive.md5"
+}
+
+verify_runtime() {
+  local runtime_dir="$1"
+  local version="$2"
+  local runner="$runtime_dir/bin/zcode.mjs"
+  local smoke_dir="$ROOT_DIR/build/zcode-linux/smoke/verify-${version}-$$"
+  [ -x "$(command -v node)" ] || return 1
+  [ -f "$runner" ] || return 1
+  [ "$(node "$runner" --version 2>/dev/null || true)" = "$version" ] || return 1
+  node "$runner" --web --help >/dev/null 2>&1 || return 1
+  node "$ROOT_DIR/scripts/zcode-distribution-smoke.mjs" \
+    --runtime-dir "$runtime_dir" \
+    --work-dir "$smoke_dir" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+verify_installed_command() {
+  local version="$1"
+  [ "$("$COMMAND_PATH" --version 2>/dev/null || true)" = "$version" ] || die "installed command version check failed"
+  "$COMMAND_PATH" --web --help >/dev/null || die "installed Web help check failed"
+  ok "installed command verified: $COMMAND_PATH"
+}
+
+verify_local() {
+  local source_dir="${1:-$RUNTIME_HOME/current}"
+  local version
+  if [ -f "$source_dir/manifest.json" ]; then
+    version=$(version_from_manifest "$source_dir")
+    verify_runtime "$source_dir/zcode" "$version" || die "local runtime verification failed"
+  else
+    [ -e "$source_dir" ] || die "installed runtime is missing: $source_dir"
+    version=$("$COMMAND_PATH" --version 2>/dev/null) || die "installed command cannot report version"
+    verify_runtime "$source_dir" "$version" || die "installed runtime verification failed"
+  fi
+  ok "runtime verified: $version"
+}
+
+menu() {
+  while true; do
+    printf '\033[2J\033[H' 2>/dev/null || true
+    local version arch build_state install_state path_state choice
+    version=$(read_package_value version 2>/dev/null || printf 'unknown')
+    arch=$(normalize_arch 2>/dev/null || printf 'unsupported')
+    [ -d "$ROOT_DIR/build/zcode-linux/$version/zcode" ] && build_state="READY $version" || build_state="NOT BUILT"
+    [ -e "$RUNTIME_HOME/current" ] && install_state="READY" || install_state="NOT INSTALLED"
+    path_contains_local_bin && path_state="CONFIGURED" || path_state="NOT CONFIGURED"
+    cat <<EOF
+ZCODE / LINUX CONTROL CONSOLE
+
+SYSTEM
+  PLATFORM    Linux
+  ARCH        $arch
+  BUILD       $build_state
+  INSTALL     $install_state
+  COMMAND     $path_state
+
+OPERATIONS
+  [1] Build       Compile current Linux platform
+  [2] Install     Install latest local build (PATH: enabled by default)
+  [3] Verify      Verify installed runtime
+  [4] Package     Create release archive and MD5
+  [5] PATH        Check or configure user command PATH
+  [6] Uninstall   Remove program, keep user data
+  [7] Purge       Remove program and user data
+  [0] Exit
+
+EOF
+    read -r -p 'Select: ' choice || exit 0
+    case "$choice" in
+      1) build_local ;;
+      2) install_command ;;
+      3) verify_local ;;
+      4) package_local ;;
+      5) configure_path ;;
+      6) bash "$UNINSTALL_SOURCE" ;;
+      7) bash "$UNINSTALL_SOURCE" --purge ;;
+      0|q|Q) exit 0 ;;
+      *) warn "unknown selection: $choice" ;;
+    esac
+    read -r -p 'Press Enter to return to menu...' _ || exit 0
+  done
+}
+
+install_command() {
+  local source_dir="$(latest_source_dir)"
+  local archive='' no_path=false no_verify=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --source) [ "$#" -ge 2 ] || die "--source requires a directory"; source_dir="$2"; shift 2 ;;
+      --archive) [ "$#" -ge 2 ] || die "--archive requires a file"; archive="$2"; shift 2 ;;
+      --no-path) no_path=true; shift ;;
+      --no-verify) no_verify=true; shift ;;
+      --help|-h|--h) usage; return 0 ;;
+      *) die "unknown install option: $1" ;;
+    esac
+  done
+
+  if [ -n "$archive" ]; then
+    require_command tar
+    local staging="$ROOT_DIR/build/zcode-linux/install-staging"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    tar -xzf "$archive" -C "$staging"
+    source_dir="$staging"
+  fi
+  install_from_source "$source_dir" "$no_path" "$no_verify"
+}
+
+main() {
+  local command="${1:-menu}"
+  shift || true
+  case "$command" in
+    -h|--h|--help|help) usage ;;
+    menu) menu ;;
+    build)
+      SKIP_BUILD=false CLEAN_BUILD=false
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --skip-build) SKIP_BUILD=true; shift ;;
+          --clean) CLEAN_BUILD=true; shift ;;
+          -h|--h|--help) usage; return 0 ;;
+          *) die "unknown build option: $1" ;;
+        esac
+      done
+      build_local
+      ;;
+    install) install_command "$@" ;;
+    verify)
+      case "${1:-}" in
+        --source) [ "$#" -ge 2 ] || die "--source requires a directory"; verify_local "$2" ;;
+        --help|-h|--h) usage ;;
+        '') verify_local ;;
+        *) die "unknown verify option: $1" ;;
+      esac
+      ;;
+    package)
+      local package_source=''
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --source) [ "$#" -ge 2 ] || die "--source requires a directory"; package_source="$2"; shift 2 ;;
+          --help|-h|--h) usage; return 0 ;;
+          *) die "unknown package option: $1" ;;
+        esac
+      done
+      package_local "$package_source"
+      ;;
+    path)
+      case "${1:---check}" in
+        --check|check) path_status ;;
+        --configure|configure) configure_path ;;
+        --help|-h|--h) usage ;;
+        *) die "unknown path option: $1" ;;
+      esac
+      ;;
+    uninstall) bash "$UNINSTALL_SOURCE" "$@" ;;
+    purge) bash "$UNINSTALL_SOURCE" --purge "$@" ;;
+    *) die "unknown command: $command (use --help)" ;;
+  esac
+}
+
+main "$@"
