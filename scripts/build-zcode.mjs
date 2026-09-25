@@ -14,20 +14,23 @@ import { installScriptSource } from "./zcode-distribution/installer.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const defaultOutDir = resolve(root, "dist", "zcode");
+const defaultLocalOutDir = resolve(root, "build", "zcode-linux");
 const defaultBaseUrl = (await loadEndpointEnv()).ZCODE_DIST_BASE_URL?.trim() || "";
 const packageDirName = "zcode";
 const usage = `Usage:
   pnpm build:zcode
+  node scripts/build-zcode.mjs --local
   node scripts/build-zcode.mjs --skip-build
   node scripts/build-zcode.mjs --version 3.3.3-dev.1
   node scripts/build-zcode.mjs --out-dir dist/zcode
   node scripts/build-zcode.mjs --base-url http://host/zcode/deps/zcode/
 
 Options:
+  --local             Build a runnable local staging directory under build/zcode-linux.
   --skip-build        Reuse existing web/server/agent build outputs.
   --version <text>    Release version. Defaults to root package.json version.
-  --out-dir <path>    Output directory. Defaults to dist/zcode.
-  --base-url <url>    Default install.sh download base URL.
+  --out-dir <path>    Output directory. Defaults to dist/zcode, or build/zcode-linux with --local.
+  --base-url <url>    Default install.sh download base URL for remote distribution mode.
   --help, -h          Show this help.
 `;
 
@@ -52,6 +55,7 @@ function parseArgs(argv) {
   const options = {
     baseUrl: defaultBaseUrl,
     help: false,
+    local: false,
     outDir: defaultOutDir,
     skipBuild: false,
     version: undefined,
@@ -64,6 +68,10 @@ function parseArgs(argv) {
     }
     if (arg === "--help" || arg === "-h") {
       options.help = true;
+      continue;
+    }
+    if (arg === "--local") {
+      options.local = true;
       continue;
     }
     if (arg === "--skip-build") {
@@ -232,11 +240,17 @@ async function createTarball({ packageParent, releaseDir, tarballName }) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  if (!options.help && !options.baseUrl)
+  if (!options.help && !options.local && !options.baseUrl)
     throw new Error("Configure ZCODE_DIST_BASE_URL in .env or pass --base-url");
   if (options.help) {
     console.log(usage);
     return;
+  }
+  if (options.local && process.platform !== "linux") {
+    throw new Error(`--local only supports Linux hosts; received ${process.platform}`);
+  }
+  if (options.local && !["x64", "arm64"].includes(process.arch)) {
+    throw new Error(`--local does not support architecture ${process.arch}`);
   }
 
   const rootPackageJson = await readJson(resolve(root, "package.json"));
@@ -247,7 +261,46 @@ async function main() {
 
   await buildOutputs(options.skipBuild);
 
-  const outDir = options.outDir;
+  const outputRoot = options.local
+    ? options.outDir === defaultOutDir
+      ? defaultLocalOutDir
+      : options.outDir
+    : options.outDir;
+  const outDir = options.local ? resolve(outputRoot, version) : outputRoot;
+
+  if (options.local) {
+    const packageRoot = resolve(outDir, packageDirName);
+    await rm(outDir, {
+      force: true,
+      recursive: true,
+    });
+    await mkdir(outDir, {
+      recursive: true,
+    });
+    await stageZCodePackage({
+      packageRoot,
+      version,
+    });
+    await writeFile(
+      resolve(outDir, "manifest.json"),
+      JSON.stringify(
+        {
+          arch: process.arch,
+          createdAt: new Date().toISOString(),
+          nodeVersion: process.versions.node,
+          platform: process.platform,
+          runtimePath: packageDirName,
+          version,
+        },
+        null,
+        2,
+      ),
+    );
+    console.log(`[zcode] local build directory: ${outDir}`);
+    console.log(`[zcode] runtime: ${packageRoot}`);
+    return;
+  }
+
   const workDir = resolve(outDir, ".work");
   const packageParent = workDir;
   const packageRoot = resolve(packageParent, packageDirName);
