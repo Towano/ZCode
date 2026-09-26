@@ -150,10 +150,20 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+ZCODE_LINUX_USE_MISE=false
+ZCODE_LINUX_MISE_BIN=''
+zcode_linux_project_command() {
+  if [ "$ZCODE_LINUX_USE_MISE" = true ]; then
+    [ -x "$ZCODE_LINUX_MISE_BIN" ] || return 127
+    (cd "$ROOT_DIR" && "$ZCODE_LINUX_MISE_BIN" exec -- "$@")
+  else
+    (cd "$ROOT_DIR" && "$@")
+  fi
+}
+
 read_package_value() {
   local key="$1"
-  require_command node
-  node -e '
+  zcode_linux_project_command node -e '
     const fs = require("node:fs");
     const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const value = data[process.argv[2]];
@@ -204,11 +214,111 @@ platform_from_manifest() {
 }
 
 require_build_toolchain() {
-  local node_version pnpm_version
+  local node_version pnpm_version mise_bin home_mise='' installer_required=false curl_missing=false manager=''
   node_version=$(node --version 2>/dev/null || true)
   pnpm_version=$(pnpm --version 2>/dev/null || true)
-  [ "$node_version" = "v24.14.0" ] || die "Node.js 24.14.0 is required; found ${node_version:-missing}"
-  [ "$pnpm_version" = "10.33.2" ] || die "pnpm 10.33.2 is required; found ${pnpm_version:-missing}"
+  if [ "$node_version" = "v24.14.0" ] && [ "$pnpm_version" = "10.33.2" ]; then
+    return 0
+  fi
+
+  mise_bin=$(command -v mise 2>/dev/null || true)
+  if [ -n "${HOME:-}" ]; then
+    home_mise="$HOME/.local/bin/mise"
+  fi
+  if [ -z "$mise_bin" ] && [ -n "$home_mise" ] && [ -x "$home_mise" ]; then
+    mise_bin="$home_mise"
+  fi
+  if [ -z "$mise_bin" ]; then
+    [ -n "$home_mise" ] || {
+      printf 'Cannot bootstrap mise without a valid HOME directory.\n' >&2
+      return 1
+    }
+    installer_required=true
+    mise_bin="$home_mise"
+    if [ -e "$mise_bin" ] || [ -L "$mise_bin" ]; then
+      printf 'Cannot install mise because the target already exists and is not executable: %s\n' "$mise_bin" >&2
+      return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+      curl_missing=true
+      manager=$(zcode_linux_current_package_manager)
+      case "$manager" in
+        apt|pacman|apk) ;;
+        *)
+          printf 'Cannot bootstrap mise: curl is missing and package manager %s is unsupported.\n' "$manager" >&2
+          return 1
+          ;;
+      esac
+    fi
+  fi
+
+  ZCODE_LINUX_MISE_BIN="$mise_bin"
+  ZCODE_LINUX_USE_MISE=true
+  printf 'BUILD TOOLCHAIN ISSUE\n\n'
+  printf 'Required: Node.js 24.14.0 and pnpm 10.33.2\n'
+  printf 'Found: Node.js %s, pnpm %s\n\n' "${node_version:-missing}" "${pnpm_version:-missing}"
+  printf 'Solution: trust this repository mise.toml, install its pinned versions and use them through mise exec.\n'
+  printf 'Impact: installs mise at %s and its managed toolchain under your user account; records this project config as trusted. System Node and shell startup files are unchanged.\n' "$mise_bin"
+  printf 'Commands to run:\n'
+  if [ "$curl_missing" = true ]; then
+    printf '  Install curl with the detected package manager:\n'
+    zcode_linux_print_package_install_commands "$manager" curl || return 1
+  fi
+  if [ "$installer_required" = true ]; then
+    printf '  $ curl -fsSL https://mise.run | MISE_INSTALL_PATH=%q sh\n' "$mise_bin"
+  fi
+  printf '  (cd %q && %q trust %q)\n' "$ROOT_DIR" "$mise_bin" "$ROOT_DIR/mise.toml"
+  printf '  (cd %q && %q install)\n' "$ROOT_DIR" "$mise_bin"
+  printf '  (cd %q && %q exec -- node --version)\n' "$ROOT_DIR" "$mise_bin"
+  printf '  (cd %q && %q exec -- pnpm --version)\n' "$ROOT_DIR" "$mise_bin"
+  printf 'Build commands after toolchain setup:\n'
+  if [ "${SKIP_BUILD:-false}" = true ]; then
+    zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" --local --skip-build
+  else
+    zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" --local
+    zcode_linux_print_project_command pnpm --filter @zcode/cli... build
+    zcode_linux_print_project_command pnpm --filter @zcode/server build
+    zcode_linux_print_project_command pnpm --filter @zcode/web build
+  fi
+  printf '\nPress Enter to install the pinned toolchain and continue. Press Esc to cancel.\n'
+  confirm_enter || {
+    printf 'Toolchain installation cancelled.\n' >&2
+    return 1
+  }
+
+  if [ "$curl_missing" = true ]; then
+    zcode_linux_run_package_install "$manager" curl || return 1
+    command -v curl >/dev/null 2>&1 || {
+      printf 'curl is still missing after package installation.\n' >&2
+      return 1
+    }
+  fi
+  if [ "$installer_required" = true ]; then
+    curl -fsSL https://mise.run | MISE_INSTALL_PATH="$mise_bin" sh || {
+      printf 'The official mise installer failed; no build was started.\n' >&2
+      return 1
+    }
+    [ -x "$mise_bin" ] || {
+      printf 'The mise installer did not create an executable at %s.\n' "$mise_bin" >&2
+      return 1
+    }
+  fi
+
+  (cd "$ROOT_DIR" && "$ZCODE_LINUX_MISE_BIN" trust "$ROOT_DIR/mise.toml") || {
+    printf 'mise trust failed; no build was started.\n' >&2
+    return 1
+  }
+  (cd "$ROOT_DIR" && "$ZCODE_LINUX_MISE_BIN" install) || {
+    printf 'mise install failed; no build was started.\n' >&2
+    return 1
+  }
+  node_version=$(zcode_linux_project_command node --version 2>/dev/null || true)
+  pnpm_version=$(zcode_linux_project_command pnpm --version 2>/dev/null || true)
+  if [ "$node_version" != "v24.14.0" ] || [ "$pnpm_version" != "10.33.2" ]; then
+    printf 'mise did not provide the required toolchain; found Node.js %s and pnpm %s.\n' \
+      "${node_version:-missing}" "${pnpm_version:-missing}" >&2
+    return 1
+  fi
 }
 
 ensure_directory() {
@@ -536,17 +646,121 @@ normalize_runtime_permissions() {
   find "$runtime_dir" -type f ! -perm /111 -exec chmod 644 {} +
 }
 
+zcode_linux_print_project_command() {
+  printf '  (cd %q &&' "$ROOT_DIR"
+  if [ "$ZCODE_LINUX_USE_MISE" = true ]; then
+    printf ' %q exec --' "$ZCODE_LINUX_MISE_BIN"
+  fi
+  printf ' %q' "$@"
+  printf ')\n'
+}
+
+zcode_linux_run_logged() {
+  local log_file="$1"
+  shift
+  if zcode_linux_project_command "$@" 2>&1 | tee -a "$log_file"; then
+    return 0
+  else
+    return $?
+  fi
+}
+
+zcode_linux_report_build_failure() {
+  local status="$1" command_text="$2" log_file="$3"
+  printf '\nBUILD FAILED\n' >&2
+  printf 'Exit code: %s\n' "$status" >&2
+  printf 'Failed command: %s\n' "$command_text" >&2
+  printf 'Full log: %s\n' "$log_file" >&2
+  printf 'Diagnostic command: grep -n -E "error|Error|ERR|failed" %q\n' "$log_file" >&2
+  printf 'No unlisted command was executed.\n' >&2
+}
+
+zcode_linux_repair_shared_dist() {
+  local log_file="$1" approved="${2:-false}"
+  local shared_dist="$ROOT_DIR/packages/shared/dist/index.js"
+  local command_text status=0
+  [ -f "$shared_dist" ] && return 0
+
+  printf '\nBUILD ISSUE\n'
+  printf 'Problem: required file is missing: %s\n' "$shared_dist"
+  printf 'Cause: the TUI runtime collector requires the compiled @zcode/shared workspace package.\n'
+  printf 'Solution and command:\n'
+  command_text=$(zcode_linux_print_project_command pnpm --filter @zcode/shared build)
+  printf '%s' "$command_text"
+  printf 'This writes compiled files under %s/packages/shared/dist.\n' "$ROOT_DIR"
+  if [ "$approved" = true ]; then
+    printf 'Running this repair from the approved build plan.\n'
+  else
+    printf 'Press Enter to run the repair and continue. Press Esc to cancel.\n'
+    confirm_enter || {
+      printf 'Build repair cancelled.\n' >&2
+      return 1
+    }
+  fi
+  zcode_linux_run_logged "$log_file" pnpm --filter @zcode/shared build || status=$?
+  if [ "$status" -ne 0 ]; then
+    zcode_linux_report_build_failure "$status" "$command_text" "$log_file"
+    return "$status"
+  fi
+  if [ ! -f "$shared_dist" ]; then
+    printf 'The repair command completed but did not create %s.\n' "$shared_dist" >&2
+    return 1
+  fi
+  ok "generated $shared_dist"
+}
+
 build_local() {
   require_linux
-  zcode_linux_preflight build
-  require_command node
-  require_command pnpm
-  require_build_toolchain
-  [ "${CLEAN_BUILD:-false}" = true ] && rm -rf "$ROOT_DIR/build/zcode-linux"
-  local args=("--local")
+  zcode_linux_preflight build || return 1
+  require_build_toolchain || return 1
+  if [ "${CLEAN_BUILD:-false}" = true ]; then
+    rm -rf "$ROOT_DIR/build/zcode-linux" || return 1
+  fi
+  local log_dir="$ROOT_DIR/build/zcode-linux/logs"
+  ensure_directory "$log_dir" 700 || return 1
+  local log_file="$log_dir/build-$(date +%Y%m%d-%H%M%S)-$$.log"
+  (umask 077 && : >"$log_file") || return 1
+  local -a args=("--local")
   [ "${SKIP_BUILD:-false}" = true ] && args+=("--skip-build")
-  node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}"
-  normalize_runtime_permissions "$ROOT_DIR/build/zcode-linux/$(read_package_value version)/zcode"
+
+  if [ "${SKIP_BUILD:-false}" = true ] && [ ! -f "$ROOT_DIR/packages/shared/dist/index.js" ]; then
+    zcode_linux_repair_shared_dist "$log_file" true || return 1
+  fi
+
+  local command_text status=0
+  command_text=$(zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}")
+  zcode_linux_run_logged "$log_file" node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}" || status=$?
+  if [ "$status" -ne 0 ] && grep -Fq 'Missing @zcode/shared dist files' "$log_file"; then
+    if zcode_linux_repair_shared_dist "$log_file"; then
+      args=("--local" "--skip-build")
+      command_text=$(zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}")
+      status=0
+      zcode_linux_run_logged "$log_file" node "$ROOT_DIR/scripts/build-zcode.mjs" "${args[@]}" || status=$?
+    else
+      zcode_linux_report_build_failure "$status" "$command_text" "$log_file"
+      return 1
+    fi
+  fi
+  if [ "$status" -ne 0 ]; then
+    zcode_linux_report_build_failure "$status" "$command_text" "$log_file"
+    return "$status"
+  fi
+
+  local version runtime_dir
+  version=$(read_package_value version) || return 1
+  runtime_dir="$ROOT_DIR/build/zcode-linux/$version/zcode"
+  normalize_runtime_permissions "$runtime_dir" || return 1
+  if ! verify_runtime "$runtime_dir" "$version"; then
+    printf '\nBUILD VERIFICATION FAILED\n' >&2
+    printf 'Runtime: %s\n' "$runtime_dir" >&2
+    printf 'The build completed, but its version/Web/smoke checks did not pass.\n' >&2
+    printf 'Diagnostic command:\n' >&2
+    zcode_linux_print_project_command node "$ROOT_DIR/scripts/zcode-distribution-smoke.mjs" \
+      --runtime-dir "$runtime_dir" \
+      --work-dir "$ROOT_DIR/build/zcode-linux/smoke/manual-verify-$$" >&2
+    return 1
+  fi
+  ok "local build verified: $runtime_dir"
 }
 
 package_local() {
@@ -573,11 +787,10 @@ verify_runtime() {
   local version="$2"
   local runner="$runtime_dir/bin/zcode.mjs"
   local smoke_dir="$ROOT_DIR/build/zcode-linux/smoke/verify-${version}-$$"
-  [ -x "$(command -v node)" ] || return 1
   [ -f "$runner" ] || return 1
-  [ "$(node "$runner" --version 2>/dev/null || true)" = "$version" ] || return 1
-  node "$runner" --web --help >/dev/null 2>&1 || return 1
-  node "$ROOT_DIR/scripts/zcode-distribution-smoke.mjs" \
+  [ "$(zcode_linux_project_command node "$runner" --version 2>/dev/null || true)" = "$version" ] || return 1
+  zcode_linux_project_command node "$runner" --web --help >/dev/null 2>&1 || return 1
+  zcode_linux_project_command node "$ROOT_DIR/scripts/zcode-distribution-smoke.mjs" \
     --runtime-dir "$runtime_dir" \
     --work-dir "$smoke_dir" >/dev/null 2>&1 || return 1
   return 0
@@ -605,16 +818,42 @@ verify_local() {
 }
 
 build_action() {
+  local shared_dist="$ROOT_DIR/packages/shared/dist/index.js"
   cat <<EOF
-BUILD
+BUILD PLAN
 
 Platform: Linux
 Architecture: $(normalize_arch)
 Output: $ROOT_DIR/build/zcode-linux
 
-Press Enter to build.
-Press Esc or Ctrl-C to cancel.
+Executor:
 EOF
+  if [ "${SKIP_BUILD:-false}" = true ]; then
+    zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" --local --skip-build
+    printf 'Reusing existing shared, CLI, Server, and Web build outputs.\n'
+  else
+    zcode_linux_print_project_command node "$ROOT_DIR/scripts/build-zcode.mjs" --local
+    printf 'Build commands (run in workspace dependency order):\n'
+    zcode_linux_print_project_command pnpm --filter @zcode/shared build
+    zcode_linux_print_project_command pnpm --filter @zcode/cli... build
+    zcode_linux_print_project_command pnpm --filter @zcode/server build
+    zcode_linux_print_project_command pnpm --filter @zcode/web build
+  fi
+  if [ ! -f "$shared_dist" ]; then
+    printf '\nDetected missing prerequisite: %s\n' "$shared_dist"
+    printf 'Cause: TUI runtime staging needs the compiled @zcode/shared workspace package.\n'
+    if [ "${SKIP_BUILD:-false}" = true ]; then
+      printf 'Repair command included in the approved plan:\n'
+      zcode_linux_print_project_command pnpm --filter @zcode/shared build
+    else
+      printf 'Solution: the approved @zcode/shared build command generates this file before runtime staging.\n'
+    fi
+  fi
+  if [ "${CLEAN_BUILD:-false}" = true ]; then
+    printf '\nCleanup: --clean will remove the previous output tree %s.\n' "$ROOT_DIR/build/zcode-linux"
+  fi
+  printf '\nPress Enter to approve this plan and continue automatically.\n'
+  printf 'Press Esc or Ctrl-C to cancel without running commands.\n'
   if confirm_enter; then
     build_local
   else
@@ -836,4 +1075,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

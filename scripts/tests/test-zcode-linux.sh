@@ -110,7 +110,6 @@ ID=some-linux
 ID_LIKE=some-family
 EOF
 
-  # This is intentionally red before scripts/zcode-linux-deps.sh exists.
   # shellcheck disable=SC1090
   source "$ROOT_DIR/scripts/zcode-linux-deps.sh"
   assert_equals "$(zcode_linux_detect_package_manager "$fixture/ubuntu")" "apt"
@@ -120,12 +119,183 @@ EOF
   assert_equals "$(zcode_linux_detect_package_manager "$fixture/cachyos")" "pacman"
   assert_equals "$(zcode_linux_detect_package_manager "$fixture/alpine")" "apk"
   assert_equals "$(zcode_linux_detect_package_manager "$fixture/unknown")" "unknown"
-  assert_equals "$(zcode_linux_required_packages build apt | paste -sd ' ' -)" "python3 make g++ pkg-config"
-  assert_equals "$(zcode_linux_required_packages build pacman | paste -sd ' ' -)" "python make gcc pkgconf"
-  assert_equals "$(zcode_linux_required_packages build apk | paste -sd ' ' -)" "python3 make g++ pkgconf"
+  assert_equals "$(zcode_linux_required_packages build apt | paste -sd ' ' -)" "coreutils grep python3 make g++ pkg-config"
+  assert_equals "$(zcode_linux_required_packages build pacman | paste -sd ' ' -)" "coreutils grep python make gcc pkgconf"
+  assert_equals "$(zcode_linux_required_packages build apk | paste -sd ' ' -)" "coreutils grep python3 make g++ pkgconf"
   assert_equals "$(zcode_linux_required_packages runtime apt | paste -sd ' ' -)" "bash tar coreutils"
   assert_equals "$(zcode_linux_required_packages archive pacman | paste -sd ' ' -)" "tar gzip coreutils"
-  pass "Linux dependency distribution mapping"
+
+  zcode_linux_print_package_install_commands apt coreutils grep python3 make g++ pkg-config >"$fixture/apt-commands"
+  zcode_linux_print_package_install_commands pacman coreutils grep python make gcc pkgconf >"$fixture/pacman-commands"
+  zcode_linux_print_package_install_commands apk coreutils grep python3 make g++ pkgconf >"$fixture/apk-commands"
+  assert_contains "$fixture/apt-commands" 'apt update'
+  assert_contains "$fixture/apt-commands" 'apt install -y coreutils grep python3 make g++ pkg-config'
+  assert_contains "$fixture/pacman-commands" 'pacman -Sy --needed --noconfirm coreutils grep python make gcc pkgconf'
+  assert_contains "$fixture/apk-commands" 'apk add coreutils grep python3 make g++ pkgconf'
+  pass "Linux dependency resolution and exact install command previews"
+}
+
+test_preflight_command_execution() {
+  local fixture="$TEST_ROOT/preflight-install"
+  local output="$TEST_ROOT/preflight-install.txt"
+  local cancel_output="$TEST_ROOT/preflight-cancel.txt"
+  local package_log="$TEST_ROOT/package-manager.log"
+  local marker="$TEST_ROOT/missing-command-marker"
+  rm -rf "$fixture" "$package_log" "$marker"
+  mkdir -p "$fixture/bin"
+  cat >"$fixture/bin/apt" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ZCODE_LINUX_PACKAGE_LOG"
+SH
+  chmod +x "$fixture/bin/apt"
+  cat >"$fixture/run-preflight.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$ROOT_DIR/scripts/zcode-linux-deps.sh"
+id() { printf '0\n'; }
+zcode_linux_current_package_manager() { printf 'apt\n'; }
+zcode_linux_missing_commands() {
+  if [ ! -f "$ZCODE_LINUX_TEST_MARKER" ]; then
+    : >"$ZCODE_LINUX_TEST_MARKER"
+    printf 'python3\n'
+  fi
+}
+zcode_linux_preflight build
+SH
+  chmod +x "$fixture/run-preflight.sh"
+  assert_command_success "$output" bash -c \
+    "printf '\\n' | env ROOT_DIR='$ROOT_DIR' PATH='$fixture/bin:$PATH' ZCODE_LINUX_PACKAGE_LOG='$package_log' ZCODE_LINUX_TEST_MARKER='$marker' bash '$fixture/run-preflight.sh'"
+  assert_contains "$output" 'apt update'
+  assert_contains "$output" 'apt install -y coreutils grep python3 make g++ pkg-config'
+  assert_contains "$package_log" 'update'
+  assert_contains "$package_log" 'install -y coreutils grep python3 make g++ pkg-config'
+
+  rm -f "$package_log" "$marker"
+  assert_command_failure "$cancel_output" bash -c \
+    "printf 'n' | env ROOT_DIR='$ROOT_DIR' PATH='$fixture/bin:$PATH' ZCODE_LINUX_PACKAGE_LOG='$package_log' ZCODE_LINUX_TEST_MARKER='$marker' bash '$fixture/run-preflight.sh'"
+  assert_contains "$cancel_output" 'Dependency installation cancelled'
+  [ ! -e "$package_log" ] || fail "package manager ran after approval was declined"
+  pass "approved dependency repair runs automatically; declined repair runs nothing"
+}
+
+test_build_plan_preview() {
+  local home="$TEST_ROOT/home-build-plan"
+  local output="$TEST_ROOT/build-plan.txt"
+  mkdir -p "$home"
+  assert_command_success "$output" bash -c \
+    "printf '\\033' | env HOME='$home' bash '$ROOT_DIR/zcode-linux' build"
+  assert_contains "$output" "BUILD PLAN"
+  assert_contains "$output" "pnpm --filter @zcode/shared build"
+  assert_contains "$output" "pnpm --filter @zcode/cli... build"
+  assert_contains "$output" "pnpm --filter @zcode/server build"
+  assert_contains "$output" "pnpm --filter @zcode/web build"
+  if [ ! -f "$ROOT_DIR/packages/shared/dist/index.js" ]; then
+    assert_contains "$output" "packages/shared/dist/index.js"
+    assert_contains "$output" "@zcode/shared build command"
+  fi
+  assert_contains "$output" "build cancelled"
+  pass "build plan previews commands and cancellation runs none"
+}
+
+test_shared_package_build() {
+  assert_command_success "$TEST_ROOT/shared-build.txt" pnpm --filter @zcode/shared build
+  assert_file "$ROOT_DIR/packages/shared/dist/index.js"
+  pass "shared workspace build creates the TUI runtime entrypoint"
+}
+
+test_mise_bootstrap() {
+  local fixture="$TEST_ROOT/mise-bootstrap"
+  local home="$fixture/home"
+  local output="$TEST_ROOT/mise-bootstrap.txt"
+  local cancel_output="$TEST_ROOT/mise-bootstrap-cancel.txt"
+  local package_log="$fixture/package-manager.log"
+  local curl_log="$fixture/curl.log"
+  local mise_log="$fixture/mise.log"
+  rm -rf "$fixture"
+  mkdir -p "$fixture/bin" "$home"
+
+  cat >"$fixture/installer.sh" <<'SH'
+mkdir -p "$(dirname "$MISE_INSTALL_PATH")"
+cat >"$MISE_INSTALL_PATH" <<'MISE'
+#!/usr/bin/env bash
+set -e
+case "$1" in
+  trust) printf 'trust\n' >>"$ZCODE_LINUX_MISE_LOG" ;;
+  install) printf 'install\n' >>"$ZCODE_LINUX_MISE_LOG" ;;
+  exec)
+    shift
+    [ "$1" = "--" ]
+    shift
+    case "$1:$2" in
+      node:--version) printf 'v24.14.0\n' ;;
+      pnpm:--version) printf '10.33.2\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+MISE
+chmod +x "$MISE_INSTALL_PATH"
+SH
+  cat >"$fixture/bin/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$ZCODE_LINUX_CURL_LOG"
+cat "$ZCODE_LINUX_TEST_INSTALLER"
+SH
+  chmod +x "$fixture/bin/curl"
+
+  cat >"$fixture/run-toolchain.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$ROOT_DIR/zcode-linux"
+command() {
+  if [ "${1:-}" = "-v" ]; then
+    case "${2:-}" in
+      mise) return 1 ;;
+      curl)
+        [ "${ZCODE_LINUX_TEST_CURL_AVAILABLE:-false}" = true ] || return 1
+        ;;
+    esac
+  fi
+  builtin command "$@"
+}
+node() { [ "${1:-}" = "--version" ] && printf 'v20.0.0\n'; }
+pnpm() { [ "${1:-}" = "--version" ] && printf '9.0.0\n'; }
+id() { printf '0\n'; }
+zcode_linux_current_package_manager() { printf 'apt\n'; }
+zcode_linux_run_package_install() {
+  printf '%s\n' "$*" >>"$ZCODE_LINUX_PACKAGE_LOG"
+  ZCODE_LINUX_TEST_CURL_AVAILABLE=true
+}
+require_build_toolchain
+printf 'mise-bin=%s\n' "$ZCODE_LINUX_MISE_BIN"
+SH
+  chmod +x "$fixture/run-toolchain.sh"
+
+  assert_command_success "$output" bash -c \
+    "printf '\\n' | env ROOT_DIR='$ROOT_DIR' HOME='$home' PATH='$fixture/bin:/usr/bin:/bin' ZCODE_LINUX_PACKAGE_LOG='$package_log' ZCODE_LINUX_CURL_LOG='$curl_log' ZCODE_LINUX_MISE_LOG='$mise_log' ZCODE_LINUX_TEST_INSTALLER='$fixture/installer.sh' bash '$fixture/run-toolchain.sh'"
+  assert_contains "$output" 'apt update'
+  assert_contains "$output" 'apt install -y curl'
+  assert_contains "$output" 'curl -fsSL https://mise.run'
+  assert_contains "$output" 'mise.toml'
+  assert_contains "$output" 'mise exec -- node'
+  assert_contains "$output" 'mise install'
+  assert_contains "$output" 'Node.js 24.14.0 and pnpm 10.33.2'
+  assert_contains "$package_log" 'curl'
+  assert_contains "$curl_log" '-fsSL https://mise.run'
+  assert_contains "$mise_log" 'trust'
+  assert_contains "$mise_log" 'install'
+  assert_file "$home/.local/bin/mise"
+  [ -x "$home/.local/bin/mise" ] || fail "mise bootstrap did not create an executable"
+  [ ! -e "$home/.bashrc" ] || fail "mise bootstrap modified the shell startup file"
+
+  rm -f "$package_log" "$curl_log" "$mise_log"
+  assert_command_failure "$cancel_output" bash -c \
+    "printf 'n' | env ROOT_DIR='$ROOT_DIR' HOME='$home' PATH='$fixture/bin:/usr/bin:/bin' ZCODE_LINUX_PACKAGE_LOG='$package_log' ZCODE_LINUX_CURL_LOG='$curl_log' ZCODE_LINUX_MISE_LOG='$mise_log' ZCODE_LINUX_TEST_INSTALLER='$fixture/installer.sh' bash '$fixture/run-toolchain.sh'"
+  assert_contains "$cancel_output" 'Toolchain installation cancelled'
+  [ ! -e "$package_log" ] || fail "package installation ran after bootstrap was declined"
+  [ ! -e "$curl_log" ] || fail "mise installer ran after bootstrap was declined"
+  pass "approved mise bootstrap installs pinned tools; declined bootstrap runs nothing"
 }
 
 test_uninstall_menu_is_safe_by_default() {
@@ -171,17 +341,20 @@ test_explicit_artifact_selection() {
 
 test_automatic_preflight() {
   local home="$TEST_ROOT/home-preflight"
-  local fixture
-  rm -rf "$home"
-  mkdir -p "$home"
+  local command_path="$TEST_ROOT/path-without-node"
+  local fixture command_name
+  rm -rf "$home" "$command_path"
+  mkdir -p "$home" "$command_path"
   fixture=$(prepare_fixture)
-  # Hide Node.js while retaining the host's shell utilities. Esc must cancel
-  # the one-shot preflight before any install path is changed.
+  for command_name in bash dirname grep head sed uname; do
+    ln -s "$(command -v "$command_name")" "$command_path/$command_name"
+  done
   assert_command_failure "$TEST_ROOT/preflight.txt" bash -c \
-    "printf '\033' | env HOME='$home' PATH='/usr/bin:/bin' bash '$ROOT_DIR/zcode-linux' install --source '$fixture' --no-verify"
+    "env HOME='$home' PATH='$command_path' bash '$ROOT_DIR/zcode-linux' install --source '$fixture' --no-verify"
   assert_contains "$TEST_ROOT/preflight.txt" "ENVIRONMENT CHECK"
   assert_contains "$TEST_ROOT/preflight.txt" "Missing dependencies"
-  [ ! -e "$home/.zcode/runtime/current" ] || fail "cancelled preflight changed current runtime"
+  assert_contains "$TEST_ROOT/preflight.txt" "Node.js 24.14.0 and pnpm 10.33.2 are required"
+  [ ! -e "$home/.zcode/runtime/current" ] || fail "preflight changed current runtime"
   pass "install performs automatic preflight before changing runtime"
 }
 
@@ -360,6 +533,18 @@ case "$MODE" in
   --preflight)
     test_automatic_preflight
     ;;
+  --preflight-install)
+    test_preflight_command_execution
+    ;;
+  --build-plan)
+    test_build_plan_preview
+    ;;
+  --shared-build)
+    test_shared_package_build
+    ;;
+  --mise-bootstrap)
+    test_mise_bootstrap
+    ;;
   --selection)
     test_explicit_artifact_selection
     ;;
@@ -384,6 +569,10 @@ case "$MODE" in
     ;;
   all)
     test_dependency_resolver
+    test_preflight_command_execution
+    test_build_plan_preview
+    test_shared_package_build
+    test_mise_bootstrap
     test_interactive_menu
     test_help
     test_path_and_uninstall

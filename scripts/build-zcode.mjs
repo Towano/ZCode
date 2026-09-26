@@ -27,7 +27,7 @@ const usage = `Usage:
 
 Options:
   --local             Build a runnable local staging directory under build/zcode-linux.
-  --skip-build        Reuse existing web/server/agent build outputs.
+  --skip-build        Reuse existing shared, web/server/agent build outputs.
   --version <text>    Release version. Defaults to root package.json version.
   --out-dir <path>    Output directory. Defaults to dist/zcode, or build/zcode-linux with --local.
   --base-url <url>    Default install.sh download base URL for remote distribution mode.
@@ -153,6 +153,7 @@ async function buildOutputs(skipBuild) {
     return;
   }
 
+  run("pnpm", ["--filter", "@zcode/shared", "build"]);
   run("pnpm", ["--filter", "@zcode/cli...", "build"]);
   await rm(resolve(root, "packages", "server", "dist"), {
     force: true,

@@ -115,7 +115,7 @@ sudo apt install python3 make g++ pkg-config
 | Arch / Manjaro / CachyOS | `pacman` | `python make gcc pkgconf` |
 | Alpine | `apk` | `python3 make g++ pkgconf` |
 
-用户界面显示 `apt`，不显示 `apt-get`。未知发行版只报告缺少的命令和建议手动安装方式，不猜测包管理器。
+`curl` 仅在需要 bootstrap 缺失的 `mise` 时按需安装：apt 使用 `curl` 包，pacman 使用 `curl` 包，apk 使用 `curl` 包。用户界面显示 `apt`，不显示 `apt-get`。未知发行版只报告缺少的命令和建议手动安装方式，不猜测包管理器。
 
 ### Node 和 pnpm
 
@@ -126,27 +126,47 @@ Node.js 24.14.0
 pnpm 10.33.2
 ```
 
-系统包管理器的 Node 版本不能直接视为满足要求。若检测到 `mise`，可以在统一确认流程中调用 `mise install`；没有 `mise` 时不覆盖用户 Node，只给出明确安装提示并停止。
+系统包管理器的 Node 版本不能直接视为满足要求。版本缺失或不匹配时，先展示解决方案及完整命令。若未安装 `mise`，批准后通过官方 Linux 安装器将 mise 二进制安装到 `$HOME/.local/bin/mise`；主安装器不修改 shell 配置。若 `curl` 也缺失，先按识别出的支持发行版展示并安装提供 `curl` 的系统包。之后在项目目录将 `mise.toml` 标记为可信，再运行 `mise install`，使用 `mise exec` 校验 Node.js 24.14.0 与 pnpm 10.33.2，再自动继续构建。该授权记录保存在 mise 用户状态中，不会改写仓库配置。不得覆盖系统 Node；取消或任一步安装/版本校验失败时停止，不继续构建。
 
 安装已构建运行包只需要 Node.js，不需要 pnpm、Python 或编译器。
 
 ## 构建
 
+### 诊断与批准的自动修复
+
+Build 在执行任何构建或系统安装命令前，只读检查平台、架构、Node/pnpm 版本、发行版构建依赖和已知 workspace 产物。对每个可自动修复的问题展示：问题与原因、解决方案、完整命令行、命令写入/影响路径。用户确认后，按顺序执行已展示的修复命令，重新检查缺失项，再自动继续完整构建；取消不执行命令。
+
+apt、pacman、apk 的预览必须展示将实际执行的全部命令。例如 apt：
+
+```bash
+sudo apt update
+sudo apt install -y coreutils grep python3 make g++ pkg-config
+```
+
+实际执行仍使用参数数组，不把展示文本交给 shell 解释。安装后必须重检命令是否可用；仍缺失则停止并输出剩余项。
+
+TUI runtime staging 要求 `packages/shared/dist/index.js`。`@zcode/shared` 是 TypeScript workspace 包，Build 必须先展示并执行对应的 workspace 构建命令；该命令由用户在 Build 计划中一次批准，随后自动完成，不要求使用者手动补跑 `pnpm build`。
+
+只允许执行代码中明确注册、可审计且在批准计划中列出的修复命令。已知修复执行失败时保留原始错误并停止；未知构建错误不得从日志中猜测或执行命令，必须报告失败步骤、原始命令、日志位置及可安全执行的诊断命令。
+
+### 构建流水线
+
 Build 内部执行：
 
 1. 自动环境前置检查。
-2. 构建 CLI/TUI/Agent workspace。
-3. 构建 Server。
-4. 构建 Web。
-5. 收集 TUI native、worker、Web、Server、Agent 和递归运行时依赖。
-6. 生成：
+2. 构建 `@zcode/shared`，生成 TUI runtime staging 所需的入口文件。
+3. 构建 CLI/TUI/Agent workspace。
+4. 构建 Server。
+5. 构建 Web。
+6. 收集 TUI native、worker、Web、Server、Agent 和递归运行时依赖。
+7. 生成：
 
 ```text
 build/zcode-linux/<version>/zcode/
 build/zcode-linux/<version>/manifest.json
 ```
 
-7. 自动完成本地构建 smoke 验证。
+8. 自动完成本地构建 smoke 验证。
 
 构建根据当前 `process.platform` / `process.arch` 工作，只支持 Linux x64 和 Linux arm64，不允许参数伪造架构或跨架构编译。
 

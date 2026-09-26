@@ -31,9 +31,9 @@ zcode_linux_current_package_manager() {
 zcode_linux_required_packages() {
   local profile="$1" manager="$2"
   case "$profile:$manager" in
-    build:apt) printf '%s\n' python3 make g++ pkg-config ;;
-    build:pacman) printf '%s\n' python make gcc pkgconf ;;
-    build:apk) printf '%s\n' python3 make g++ pkgconf ;;
+    build:apt) printf '%s\n' coreutils grep python3 make g++ pkg-config ;;
+    build:pacman) printf '%s\n' coreutils grep python make gcc pkgconf ;;
+    build:apk) printf '%s\n' coreutils grep python3 make g++ pkgconf ;;
     runtime:apt|runtime:pacman|runtime:apk) printf '%s\n' bash tar coreutils ;;
     archive:apt|archive:pacman|archive:apk) printf '%s\n' tar gzip coreutils ;;
     *) return 2 ;;
@@ -43,8 +43,8 @@ zcode_linux_required_packages() {
 zcode_linux_required_commands() {
   local profile="$1" manager="${2:-$(zcode_linux_current_package_manager)}"
   case "$profile:$manager" in
-    build:apt|build:apk) printf '%s\n' python3 make g++ pkg-config ;;
-    build:pacman) printf '%s\n' python make gcc pkg-config ;;
+    build:apt|build:apk) printf '%s\n' python3 make g++ pkg-config grep find tee date ;;
+    build:pacman) printf '%s\n' python make gcc pkg-config grep find tee date ;;
     runtime:*) printf '%s\n' node bash tar md5sum ;;
     archive:*) printf '%s\n' tar gzip md5sum ;;
     *) return 2 ;;
@@ -64,9 +64,51 @@ zcode_linux_print_missing() {
   printf '%s\n' "$missing" | sed '/^$/d; s/^/  /'
 }
 
+zcode_linux_print_command() {
+  local argument
+  printf '  $'
+  for argument in "$@"; do
+    printf ' %q' "$argument"
+  done
+  printf '\n'
+}
+
+zcode_linux_print_package_install_commands() {
+  local manager="$1"
+  shift
+  local packages=("$@") privilege=() missing_sudo=false
+  if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      privilege=(sudo)
+    else
+      missing_sudo=true
+    fi
+  fi
+  case "$manager" in
+    apt)
+      zcode_linux_print_command "${privilege[@]}" apt update
+      zcode_linux_print_command "${privilege[@]}" apt install -y "${packages[@]}"
+      ;;
+    pacman)
+      zcode_linux_print_command "${privilege[@]}" pacman -Sy --needed --noconfirm "${packages[@]}"
+      ;;
+    apk)
+      zcode_linux_print_command "${privilege[@]}" apk add "${packages[@]}"
+      ;;
+    *)
+      printf 'Unsupported package manager: %s\n' "$manager" >&2
+      return 1
+      ;;
+  esac
+  if [ "$missing_sudo" = true ]; then
+    printf 'sudo is missing; run the displayed commands as root or install sudo before continuing.\n' >&2
+    return 1
+  fi
+}
+
 zcode_linux_confirm_install() {
   local key
-  printf 'Install all missing dependencies? [Y/n] '
+  printf 'Run the commands above to install dependencies? [Y/n] '
   if ! IFS= read -r -n 1 -s key; then
     printf '\n'
     return 1
@@ -85,7 +127,7 @@ zcode_linux_run_package_install() {
   local packages=("$@") privilege=()
   if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 || {
-      printf 'Missing sudo; install these packages manually: %s\n' "${packages[*]}" >&2
+      printf 'Missing sudo; cannot execute the package installation commands.\n' >&2
       return 1
     }
     privilege=(sudo)
@@ -109,6 +151,7 @@ zcode_linux_run_package_install() {
 
 zcode_linux_preflight() {
   local profile="$1" manager missing packages
+  local -a package_args=()
   manager=$(zcode_linux_current_package_manager)
   missing=$(zcode_linux_missing_commands "$profile" "$manager")
   if [ -z "$missing" ]; then
@@ -129,22 +172,23 @@ zcode_linux_preflight() {
   esac
 
   if printf '%s\n' "$missing" | grep -Eq '^(node|pnpm)$'; then
-    printf '\nNode.js 24.14.0 and pnpm 10.33.2 are required. Install the pinned toolchain with mise, then rerun this operation.\n' >&2
+    printf '\nNode.js 24.14.0 and pnpm 10.33.2 are required; use the pinned toolchain in mise.toml.\n' >&2
     return 1
   fi
 
   packages=$(zcode_linux_required_packages "$profile" "$manager")
-  printf '\nPackages to install:\n'
-  printf '%s\n' "$packages" | sed 's/^/  /'
+  mapfile -t package_args <<<"$packages"
+  printf '\nSolution: install the packages that provide the missing commands.\n'
+  printf 'Commands to run:\n'
+  zcode_linux_print_package_install_commands "$manager" "${package_args[@]}" || return 1
   zcode_linux_confirm_install || {
     printf 'Dependency installation cancelled.\n' >&2
     return 1
   }
-  # shellcheck disable=SC2086
-  zcode_linux_run_package_install "$manager" $packages || return 1
+  zcode_linux_run_package_install "$manager" "${package_args[@]}" || return 1
   missing=$(zcode_linux_missing_commands "$profile" "$manager")
   if [ -n "$missing" ]; then
-    printf 'Dependencies are still missing:\n' >&2
+    printf 'Dependencies are still missing after installation:\n' >&2
     zcode_linux_print_missing "$missing" >&2
     return 1
   fi

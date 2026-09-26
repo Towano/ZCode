@@ -138,7 +138,7 @@ Linux 本地流程只面向当前执行机器的平台和架构，不做跨架�
 [0] 退出
 ```
 
-编译和安装会自动检查环境，不需要先运行隐藏的诊断命令。缺失依赖会一次性列出；按 `Enter` 安装或确认，按 `Esc` / `Ctrl-C` 取消。安装不会自动编译，也不会默认选择最新构建：先从 `build/zcode-linux/` 选择具体构建，再按 `Enter` 确认。
+编译会先展示平台、构建命令，以及已发现的缺失项、原因、修复方案和影响路径；按 `Enter` 批准构建，按 `Esc` / `Ctrl-C` 取消。缺少系统构建依赖时，脚本会先列出该发行版实际执行的完整包管理器命令，获得确认后自动安装、复检并继续。`@zcode/shared` 的缺失构建产物也会由 workspace 构建自动补齐。遇到已知可修复的组包错误时，脚本会说明原因和修复命令，确认后自动执行并重试；未知错误会保留原始日志，不会从日志中执行未审查命令。安装不会自动编译，也不会默认选择最新构建：先从 `build/zcode-linux/` 选择具体构建，再按 `Enter` 确认。
 
 支持的 Linux 包管理器只有：
 
@@ -146,10 +146,11 @@ Linux 本地流程只面向当前执行机器的平台和架构，不做跨架�
 - Arch / Manjaro / CachyOS：`pacman`
 - Alpine：`apk`
 
-构建要求 Node.js `24.14.0` 和 pnpm `10.33.2`；已安装的运行包只要求 Node.js。流程只生成当前机器的 Linux x64 或 arm64 构建。构建临时目录位于 `build/zcode-linux/`，发行归档位于仓库根目录 `release/`：
+构建要求 Node.js `24.14.0` 和 pnpm `10.33.2`；版本不匹配时，脚本会说明原因、影响路径和完整命令，批准后通过 `mise` 自动安装锁定工具链并继续构建。缺少 `mise` 时会先询问是否将官方二进制安装到 `~/.local/bin/mise`，并将仓库的 `mise.toml` 记录为可信配置；不会修改系统 Node 或 shell 配置。缺少 `curl` 时也会展示并在批准后安装对应系统包。已安装的运行包只要求 Node.js。流程只生成当前机器的 Linux x64 或 arm64 构建。构建临时目录位于 `build/zcode-linux/`，诊断日志位于 `build/zcode-linux/logs/`，发行归档位于仓库根目录 `release/`：
 
 ```text
 build/zcode-linux/<version>/     # 本地可运行构建
+build/zcode-linux/logs/           # 构建诊断日志
 release/zcode-<version>-linux-<arch>.tar.gz
 release/zcode-<version>-linux-<arch>.tar.gz.md5
 ```
