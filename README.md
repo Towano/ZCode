@@ -123,7 +123,7 @@ node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
 
 ### Linux 本地构建与用户级安装
 
-Linux 本地流程只面向当前执行机器的平台和架构，不做跨架构编译。普通用户只需要从仓库根目录运行：
+Linux 本地流程只面向当前执行机器的平台和架构，不做跨架构编译。行为与安全约束见 [Linux 本地构建设计说明](docs/linux-local-install-design.md)。普通用户只需要从仓库根目录运行：
 
 ```bash
 ./zcode-linux
@@ -243,13 +243,13 @@ pnpm build:zcode --help
 ```bash
 zcode_version=$(node -p "require('./dist/zcode/latest.json').version")
 mkdir -p dist/zcode/debug
-tar -xzf "dist/zcode/releases/$zcode_version/zcode-$zcode_version.tar.gz" \
+tar -xzf "dist/zcode/releases/$zcode_version/zcode-$zcode_version.tar.gz" \\
   -C dist/zcode/debug
 # 默认启动 TUI
 node dist/zcode/debug/zcode/bin/zcode.mjs
 
 # 启动 Web
-node dist/zcode/debug/zcode/bin/zcode.mjs --web \
+node dist/zcode/debug/zcode/bin/zcode.mjs --web \\
   --workspace "$PWD" --port 3030 --no-open
 ```
 
