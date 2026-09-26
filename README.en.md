@@ -15,6 +15,7 @@ ZCode is an AI coding workspace with desktop, browser, and terminal interfaces. 
 
 ## Updates
 
+- 2026-9-26: Removed the leftover file from the retired Superpowers plugin directory; existing skill display behavior remains unchanged and third-party notices are updated.
 - 2026-9-23: Updated to ZCode v3.14.3.
 
 ## Setup

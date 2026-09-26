@@ -10,7 +10,9 @@ export const hashBytes = (bytes) => createHash("sha256").update(bytes).digest("h
 const unsupportedCanvas = new Set([
   "@napi-rs/canvas-android-arm64",
   "@napi-rs/canvas-linux-arm-gnueabihf",
+  "@napi-rs/canvas-linux-arm64-musl",
   "@napi-rs/canvas-linux-riscv64-gnu",
+  "@napi-rs/canvas-linux-x64-musl",
 ]);
 const noticeName =
   /(?:^|[._-])(?:licen[sc]es?|copying|notice|copyright|unlicense|third.party|ofl)(?:[._-]|$)/iu;
